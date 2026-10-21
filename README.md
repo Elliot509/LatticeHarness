@@ -1,4 +1,4 @@
-# Lattice Harness
+# Lattice Harness in experimental beta
 
 A local, task-oriented agent harness with real tools, durable execution records,
 and explicit verification. **Experimental prerelease · 0.0.0 · MIT.**
