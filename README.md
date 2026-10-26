@@ -10,7 +10,8 @@ and why the task can finish or needs human input. Its tools change files and run
 processes; the conversation is one view of that work.
 
 [Install](#installation) · [First task](#first-task) · [Português](#primeiro-uso-em-português)
-· [Architecture](#architecture) · [Security](SECURITY.md) · [Contributing](#development)
+· [Education](#educational-use) · [Architecture](#architecture) · [Security](SECURITY.md)
+· [Contributing](#development)
 
 ## Current capabilities
 
@@ -31,8 +32,9 @@ processes; the conversation is one view of that work.
   without a human decision.
 - Human acceptance distinct from automatic verification, and an optional per-task
   confirmation mode for edits and commands (see below).
-- A single executor with a visible queue, archiving, persisted drafts and last task,
-  and safe Markdown rendering of model answers (code blocks, tables, lists, links).
+- A single executor with a visible queue, archiving, drafts and last open task kept
+  in the browser profile (see the desktop restart limitation below), and safe Markdown
+  rendering of model answers (code blocks, tables, lists, links).
 - OpenAI-compatible provider configuration, model discovery/manual IDs, guidance and
   model switching. Active and pending selections are distinct.
 - A web UI and an Electron desktop shell with a native project chooser.
@@ -75,7 +77,7 @@ but was not available for a fresh local run; that is a validation gap.
 There is no registry installation claim. From a built checkout, `npm pack`
 creates a small local package. Pack/install tests exercise an isolated global
 prefix, `npm exec`, the installed CLI/UI, a real code-edit/test fixture and a
-v1→v3 SQLite migration. `desktop/PORTABLE.md` is included in this package.
+v1→v4 SQLite migration. `desktop/PORTABLE.md` is included in this package.
 
 The npm package contains compiled application code and documentation. It
 **does not include the Electron runtime** and is distinct from a portable desktop
@@ -164,6 +166,62 @@ criada e critério satisfeito, sem looping. Isso não certifica o modelo em gera
 Windows/Ubuntu continuam exigindo suas próprias validações do aplicativo nativo.
 Não há link de binário público nesta revisão.
 
+## Educational use
+
+Lattice can support programming classes because each step of the agent is visible,
+limited to the chosen project folder and recorded. It does not grade, tutor or
+replace the teacher's guidance, and it has not been evaluated pedagogically: no
+learning improvement is claimed. Model answers can be wrong; the timeline, the diff
+and the tests exist so that students check them.
+
+- **Exploring an unfamiliar project.** Ask for an explanation; the timeline shows
+  which files were listed and read before the answer.
+- **Understanding code.** Follow-up messages continue the session: each one is a new
+  task that receives the previous conversation as context.
+- **Guided debugging.** Describe a wrong result; the agent can run the program and
+  its tests, and the observed exit code and test counts appear next to its hypothesis.
+- **Deciding before changing.** With **Pedir minha confirmação…** ticked, every edit
+  and command waits for approval and shows its exact arguments (for an edit, the
+  literal old and new text). Follow-up tasks keep that policy.
+- **Reviewing a change.** Each edit keeps a diff of the retained previews
+  (**Ver alterações**).
+- **Verifying with tests.** A request that names tests ends as **Concluído** only when
+  Lattice itself observes passing tests. An answer-only task is marked as delivered,
+  not as correct.
+
+A classroom sequence that matches these mechanics, in one session:
+
+1. `Explique o que este projeto faz.` — read-only exploration.
+2. `Por que <entrada> produz <resultado errado>?` — the agent may run the program and
+   the tests and proposes a cause; nothing is changed.
+3. `Corrija <função> e rode os testes para confirmar.` — the edit and the test command
+   wait for approval; completion requires observed passing tests.
+4. `Por que a correção funciona?` — explanation of the change that was made.
+
+Test counts are recognized from TAP lines (`ok 1 - …`, `not ok 2 - …`) or the
+`node --test` summary. The default output of Python's `unittest` or `pytest` is not
+counted, so a Python exercise needs a runner that prints TAP. Python also writes
+`__pycache__` next to imported modules, which is a project change during the run;
+set `sys.dont_write_bytecode = True` in the test entry point.
+
+What has been shown so far: this sequence was rehearsed end to end in the desktop app
+against a scripted local OpenAI-compatible server that is not a model. That proves
+the harness mechanics (tools, approvals, diff, test observation, persistence), not the
+quality of a model's explanations or fixes. An earlier trial with a hosted model
+handled reading and explanations but failed a multi-step Python correction; the edit
+version defect involved there has since been fixed, and that scenario has not been
+repeated with a hosted model.
+
+### Uso educacional (resumo)
+
+O Lattice pode apoiar aulas de programação porque cada passo do agente é visível,
+limitado à pasta escolhida e registrado: explorar um projeto, perguntar sobre o
+código, investigar um erro com o programa e os testes, aprovar cada alteração antes
+que aconteça, revisar o diff e confirmar o resultado com testes observados pelo
+próprio Lattice. O professor continua responsável pela orientação; não há avaliação
+pedagógica nem promessa de melhora no aprendizado, e as respostas do modelo podem
+estar erradas.
+
 ## Tasks, conversation and recovery
 
 | UI label | State | Meaning and what you can do |
@@ -208,10 +266,13 @@ enforces it before admission, also for direct protocol calls:
 - Decisions appear in the timeline (**Você aprovou / Você negou**). A decision is
   not a result: the action's own receipt says what happened.
 
-The mode is **off by default** (the documented `local-trusted` behavior); the
-choice is remembered in the browser profile. Confirmation is consent, not
-containment: an approved command runs with your user privileges, and it is not an
-OS sandbox or a typed restriction.
+The mode is **off by default** (the documented `local-trusted` behavior). The web
+UI remembers the choice in the browser profile for the same address. The desktop
+app serves its UI on a new local port at every start, so this box, unsent drafts
+and the last open task start fresh after a desktop restart: tick it again before
+creating the task. Tasks already created keep their policy. Confirmation is
+consent, not containment: an approved command runs with your user privileges, and
+it is not an OS sandbox or a typed restriction.
 
 ## Architecture
 
@@ -325,6 +386,15 @@ endpoint; no durable key store is supplied. History/nonsecret defaults persist
 locally. Desktop uses `${XDG_DATA_HOME:-~/.local/share}/lattice` on Linux and
 `%LOCALAPPDATA%\Lattice` on Windows, including its browser profile. Keep those data
 when replacing application binaries if you want to retain history.
+
+**Separate data folders.** To keep an independent profile (for example a classroom
+demonstration next to an everyday installation), start the desktop app with
+`LATTICE_DESKTOP_DATA_DIR=/path/to/profile` and, optionally,
+`LATTICE_DESKTOP_WORKSPACE=/path/to/project` for the initial project. The CLI and web
+UI take `--data-dir <path>` or `LATTICE_DATA_DIR`. Each folder holds its own database,
+settings and browser profile, and one desktop window per folder: a second launch on
+the same folder focuses the open window. Opening a folder with a newer build can
+upgrade it for good; see the version rule below.
 
 **Data folder versions.** This version stores its data in schema **v4**: it records
 confirmation policies, pending approvals and interrupted tasks that earlier builds
