@@ -6,6 +6,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Buffer } from "node:buffer";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 const root = process.cwd();
 const platform = process.env["LATTICE_P0_PLATFORM"] ?? process.platform;
@@ -53,6 +55,24 @@ if (contains(outputPath, physicalPath(root)) || overlaps(outputPath, physicalPat
 for (const input of ["package.json", "desktop/package.json", "dist/ui", ...appEntries.map((entry) => path.join("dist", entry))]) {
   if (overlaps(outputPath, physicalPath(path.join(root, input)))) fail(`output overlaps application input ${input}`);
 }
+
+// The bundle copies dist/ as it is: refuse output compiled before the
+// newest source change, or SOURCE-IDENTITY would name a different source.
+function newestMtime(dir) {
+  let newest = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    newest = Math.max(newest, entry.isDirectory() ? newestMtime(full) : fs.statSync(full).mtimeMs);
+  }
+  return newest;
+}
+const builtAt = Math.min(...["dist/cli/main.js", "dist/ui/app.js", "dist/desktop/main.cjs"].map((file) => {
+  const stat = fs.statSync(path.join(root, file), { throwIfNoEntry: false });
+  if (stat === undefined) fail(`${file} is missing; run npm run build first`);
+  return stat.mtimeMs;
+}));
+const sourcesChangedAt = Math.max(newestMtime(path.join(root, "src")), fs.statSync(path.join(root, "package.json")).mtimeMs);
+if (sourcesChangedAt > builtAt) fail("dist/ is older than its sources; run npm run build first");
 
 const executable = path.join(electronDist, platform === "win32" ? "electron.exe" : "electron");
 if (!fs.existsSync(executable) || !fs.existsSync(path.join(electronDist, "version"))) fail("selected runtime is missing its executable or version file");
@@ -165,4 +185,59 @@ const manifest = {
   builtAt: new Date().toISOString(),
 };
 fs.writeFileSync(path.join(outRoot, "manifest.json"), JSON.stringify(manifest, null, 2));
-process.stdout.write(`p0-bundle: wrote ${outRoot} for ${platform}\n`);
+
+// Source identity (docs/PUBLICATION_BOUNDARIES.md, build provenance): the
+// exact source the bundle was assembled from, not only HEAD. A dirty tree
+// is declared as such, with a digest per changed or untracked file.
+function git(args) {
+  try { return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); } catch { return null; }
+}
+const sha256 = (file) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+const porcelain = git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+let localChanges = null;
+if (porcelain !== null) {
+  localChanges = [];
+  const fields = porcelain.split("\0").filter((field) => field !== "");
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    const code = field.slice(0, 2);
+    const changed = field.slice(3);
+    if (code.includes("R") || code.includes("C")) index += 1;
+    const absolute = path.join(root, changed);
+    const isFile = fs.statSync(absolute, { throwIfNoEntry: false })?.isFile() === true;
+    localChanges.push({ status: code.trim(), path: changed, sha256: isFile ? sha256(absolute) : null });
+  }
+}
+const staged = git(["diff", "--cached", "--name-only"]);
+const typescriptPackage = path.join(root, "node_modules", "typescript", "package.json");
+const identity = {
+  tree: path.basename(root),
+  remoteUrl: git(["remote", "get-url", "origin"])?.trim() ?? null,
+  head: git(["rev-parse", "HEAD"])?.trim() ?? null,
+  branch: git(["rev-parse", "--abbrev-ref", "HEAD"])?.trim() ?? null,
+  dirty: localChanges === null ? null : localChanges.length > 0,
+  indexEmpty: staged === null ? null : staged.trim() === "",
+  localChanges,
+  artifactVersion: JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version,
+  distBuiltAt: new Date(builtAt).toISOString(),
+  builtAt: manifest.builtAt,
+  toolchain: { node: process.version, electron: electronVersion, typescript: fs.existsSync(typescriptPackage) ? JSON.parse(fs.readFileSync(typescriptPackage, "utf8")).version : null },
+};
+fs.writeFileSync(path.join(outRoot, "SOURCE-IDENTITY.json"), JSON.stringify(identity, null, 2));
+
+// Content manifest of everything shipped, so the artifact can be checked
+// against this record later.
+const files = [];
+function walk(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) walk(full);
+    else if (entry.isFile()) {
+      const stat = fs.statSync(full);
+      files.push({ path: path.relative(outRoot, full).split(path.sep).join("/"), sha256: sha256(full), bytes: stat.size, mode: `0o${(stat.mode & 0o777).toString(8)}` });
+    }
+  }
+}
+walk(outRoot);
+fs.writeFileSync(path.join(outRoot, "BUILD-MANIFEST.json"), JSON.stringify({ files }, null, 2));
+process.stdout.write(`p0-bundle: wrote ${outRoot} for ${platform}${identity.dirty === true ? " (dirty source tree; see SOURCE-IDENTITY.json)" : ""}\n`);
