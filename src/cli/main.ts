@@ -6,7 +6,7 @@ import { checkRuntimeVersion } from "../platform/runtime.js";
 import { claimOwnership, currentSchemaVersion, openLatticeDb } from "../storage/db.js";
 import { SCHEMA_VERSION } from "../storage/schema.js";
 import { runTaskCommand } from "./run.js";
-import { exportCommand, resumeCommand, sessionsCommand, wakeCommand } from "./continuity.js";
+import { acceptCommand, exportCommand, reconcileCommand, resumeCommand, sessionsCommand, wakeCommand } from "./continuity.js";
 import { uiCommand } from "./ui.js";
 
 const PACKAGE_VERSION = "0.0.0";
@@ -35,7 +35,9 @@ function printHelp(): void {
     "  lattice run --task <objective> [options]",
     "  lattice run --resume <taskId> [options]",
     "  lattice sessions [--json]",
-    "  lattice resume <taskId> [--json]",
+    "  lattice resume <taskId> [--acknowledge-unknown] [--json]",
+    "  lattice accept <taskId> [--note <text>]",
+    "  lattice reconcile <taskId> <attemptId> [--action observe|acknowledge|treat-as-applied|treat-as-not-applied] [--note <text>] [--json]",
     "  lattice export --session <id> --out <path>",
     "  lattice wake <taskId> --source <s> --cursor <c> --observation <text> [--wait <id>] [--level]",
     "  lattice ui [--workspace <path>] [--port <n>] [--no-open]",
@@ -55,6 +57,9 @@ function printHelp(): void {
     "  --observation <t>   what was observed (wake command)",
     "  --wait <id>         wait record to fire, when known (wake command)",
     "  --level             level wake with stable id instead of edge wake (wake command)",
+    "  --acknowledge-unknown  record that you saw the UNKNOWN effects and continue with them pending (resume, run --resume)",
+    "  --action <a>        reconcile action: observe (default), acknowledge, treat-as-applied, treat-as-not-applied",
+    "  --note <text>       note recorded with a reconcile decision",
     "  --provider <name>   fake or a known provider preset: openai, openrouter, gemini, abacus, local, custom (run command)",
     "  --model <name>      model identifier (run command)",
     "  --base-url <url>    OpenAI-compatible base URL, e.g. a local server (run command)",
@@ -119,6 +124,7 @@ interface RunOptions {
   maxTotalTokens?: number | undefined;
   taskExpiryMs?: number | undefined;
   resumeTaskId?: string | undefined;
+  acknowledgeUnknown?: boolean | undefined;
 }
 
 interface SessionsOptions {
@@ -133,6 +139,26 @@ interface ResumeOptions {
   workspace?: string | undefined;
   dataDir?: string | undefined;
   taskId: string;
+  json: boolean;
+  acknowledgeUnknown: boolean;
+}
+
+interface AcceptOptions {
+  command: "accept";
+  workspace?: string | undefined;
+  dataDir?: string | undefined;
+  taskId: string;
+  note?: string | undefined;
+}
+
+interface ReconcileOptions {
+  command: "reconcile";
+  workspace?: string | undefined;
+  dataDir?: string | undefined;
+  taskId: string;
+  attemptId: string;
+  action: "observe" | "acknowledge" | "treat-as-applied" | "treat-as-not-applied";
+  note?: string | undefined;
   json: boolean;
 }
 
@@ -172,8 +198,11 @@ function takeValue(argv: readonly string[], index: number, flag: string): string
   return value;
 }
 
-function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOptions | SessionsOptions | ResumeOptions | ExportOptions | WakeOptions {
-  let command: "status" | "run" | "ui" | "sessions" | "resume" | "export" | "wake" = argv.length === 0 ? "ui" : "status";
+function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOptions | SessionsOptions | ResumeOptions | ReconcileOptions | AcceptOptions | ExportOptions | WakeOptions {
+  let command: "status" | "run" | "ui" | "sessions" | "resume" | "reconcile" | "accept" | "export" | "wake" = argv.length === 0 ? "ui" : "status";
+  let acknowledgeUnknown = false;
+  let reconcileAction: ReconcileOptions["action"] = "observe";
+  let note: string | undefined;
   let workspace: string | undefined;
   let dataDir: string | undefined;
   let json = false;
@@ -236,6 +265,16 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
     } else if (arg === "--wait") {
       wakeWaitId = takeValue(argv, i + 1, arg);
       i += 1;
+    } else if (arg === "--acknowledge-unknown") {
+      acknowledgeUnknown = true;
+    } else if (arg === "--action") {
+      const value = takeValue(argv, i + 1, arg);
+      if (value !== "observe" && value !== "acknowledge" && value !== "treat-as-applied" && value !== "treat-as-not-applied") fail("--action must be observe, acknowledge, treat-as-applied or treat-as-not-applied");
+      reconcileAction = value;
+      i += 1;
+    } else if (arg === "--note") {
+      note = takeValue(argv, i + 1, arg);
+      i += 1;
     } else if (arg === "--level") {
       wakeLevel = true;
     } else if (arg === "--provider") {
@@ -291,7 +330,7 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
     } else if (arg === "--version" || arg === "-V") {
       process.stdout.write(`${PACKAGE_VERSION}\n`);
       process.exit(0);
-    } else if (arg === "status" || arg === "run" || arg === "ui" || arg === "sessions" || arg === "resume" || arg === "export" || arg === "wake") {
+    } else if (arg === "status" || arg === "run" || arg === "ui" || arg === "sessions" || arg === "resume" || arg === "reconcile" || arg === "accept" || arg === "export" || arg === "wake") {
       // The first command word wins: later positionals (task ids) must not
       // flip the command.
       if (command !== "status") {
@@ -302,6 +341,8 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
       if (arg === "ui") command = "ui";
       if (arg === "sessions") command = "sessions";
       if (arg === "resume") command = "resume";
+      if (arg === "reconcile") command = "reconcile";
+      if (arg === "accept") command = "accept";
       if (arg === "export") command = "export";
       if (arg === "wake") command = "wake";
       continue;
@@ -311,10 +352,10 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
       positional.push(arg);
     }
   }
-  if (positional.length > 1) fail("at most one workspace argument is accepted");
-  // Resume and wake take ids positionally; every other command takes an
-  // optional workspace there.
-  const idCommands = command === "resume" || command === "wake";
+  if (positional.length > (command === "reconcile" ? 2 : 1)) fail("at most one workspace argument is accepted");
+  // Resume, reconcile and wake take ids positionally; every other command
+  // takes an optional workspace there.
+  const idCommands = command === "resume" || command === "wake" || command === "reconcile" || command === "accept";
   if (!idCommands && positional.length === 1 && workspace !== undefined) {
     fail("pass the workspace either positionally or via --workspace, not both");
   }
@@ -339,6 +380,7 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
         maxIterations,
         maxModelAttempts, maxTotalTokens, taskExpiryMs,
         resumeTaskId,
+        acknowledgeUnknown,
       };
     }
     if (task === undefined || task.trim() === "") fail("run requires --task with a non-empty objective");
@@ -364,7 +406,15 @@ function parseArgs(argv: readonly string[]): StatusOptions | RunOptions | UiOpti
   }
   if (command === "resume") {
     if (positional.length === 0) fail("resume requires a task id");
-    return { command: "resume", workspace: resolvedWorkspace, dataDir, taskId: positional[0] as string, json };
+    return { command: "resume", workspace: resolvedWorkspace, dataDir, taskId: positional[0] as string, json, acknowledgeUnknown };
+  }
+  if (command === "accept") {
+    if (positional.length === 0) fail("accept requires a task id");
+    return { command: "accept", workspace: resolvedWorkspace, dataDir, taskId: positional[0] as string, ...(note === undefined ? {} : { note }) };
+  }
+  if (command === "reconcile") {
+    if (positional.length < 2) fail("reconcile requires a task id and an attempt id");
+    return { command: "reconcile", workspace: resolvedWorkspace, dataDir, taskId: positional[0] as string, attemptId: positional[1] as string, action: reconcileAction, ...(note === undefined ? {} : { note }), json };
   }
   if (command === "export") {
     if (sessionId === undefined) fail("export requires --session");
@@ -455,7 +505,7 @@ function renderHuman(report: StatusReport): string {
 }
 
 export function main(argv: readonly string[] = process.argv.slice(2)): void {
-  let options: StatusOptions | RunOptions | UiOptions | SessionsOptions | ResumeOptions | ExportOptions | WakeOptions;
+  let options: StatusOptions | RunOptions | UiOptions | SessionsOptions | ResumeOptions | ReconcileOptions | AcceptOptions | ExportOptions | WakeOptions;
   try {
     options = parseArgs(argv);
   } catch (error) {
@@ -502,6 +552,7 @@ export function main(argv: readonly string[] = process.argv.slice(2)): void {
       ...(options.maxTotalTokens === undefined ? {} : { maxTotalTokens: options.maxTotalTokens }),
       ...(options.taskExpiryMs === undefined ? {} : { taskExpiryMs: options.taskExpiryMs }),
       ...(options.resumeTaskId !== undefined ? { resumeTaskId: options.resumeTaskId } : {}),
+      ...(options.acknowledgeUnknown === true ? { acknowledgeUnknown: true } : {}),
     })
       .then((code) => process.exit(code))
       .catch((error: unknown) => fail("run failed", error));
@@ -514,9 +565,21 @@ export function main(argv: readonly string[] = process.argv.slice(2)): void {
     return;
   }
   if (options.command === "resume") {
-    resumeCommand({ workspace: options.workspace ?? process.cwd(), dataDir: dataDir, taskId: options.taskId, json: options.json })
+    resumeCommand({ workspace: options.workspace ?? process.cwd(), dataDir: dataDir, taskId: options.taskId, json: options.json, acknowledgeUnknown: options.acknowledgeUnknown })
       .then((code) => process.exit(code))
       .catch((error: unknown) => fail("resume failed", error));
+    return;
+  }
+  if (options.command === "accept") {
+    acceptCommand({ workspace: options.workspace ?? process.cwd(), dataDir: dataDir, taskId: options.taskId, note: options.note ?? null })
+      .then((code) => process.exit(code))
+      .catch((error: unknown) => fail("accept failed", error));
+    return;
+  }
+  if (options.command === "reconcile") {
+    reconcileCommand({ workspace: options.workspace ?? process.cwd(), dataDir: dataDir, taskId: options.taskId, attemptId: options.attemptId, action: options.action, note: options.note ?? null, json: options.json })
+      .then((code) => process.exit(code))
+      .catch((error: unknown) => fail("reconcile failed", error));
     return;
   }
   if (options.command === "export") {

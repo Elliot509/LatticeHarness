@@ -104,3 +104,44 @@ describe("ui presentation", () => {
     expect(taskStateDescription(snapshot({ state }))).toBe(description);
   });
 });
+
+describe("one event, one row", () => {
+  it("renders a message that is also a steering record only once", async () => {
+    const { taskActivity: activity } = await import("../../src/ui/presentation.js");
+    const base = { protocol: "ui-1" as const, taskId: "t", rootId: "r", workspace: "/w", objective: "o", acceptanceCriteria: [], state: "RUNNING" as const, stateReason: "", contractRevision: 2, provider: "p", model: "m", baseUrl: null, keyConfigured: true, unknowns: 0, unknownHistory: [], waits: [], resumable: false, resumeBlockers: [], budget: { grantedCalls: null, grantedTokens: null, reservedCalls: 0, reservedTokens: 0, settledCalls: 0, settledTokens: 0 }, contextUsage: { known: false as const }, tools: [], verifications: [], cut: 3 };
+    const items = activity({ ...base,
+      messages: [{ id: "msg-cmd-1", seq: 2, author: "user", text: "também confira o limite", recordedAt: "x" }],
+      steering: [
+        { id: "msg-cmd-1", seq: 3, text: "também confira o limite", mode: "guide", state: "applied", expectedRevision: 1, appliedRevision: 2, recordedAt: "x" },
+        { id: "steer-legacy", seq: 1, text: "orientação antiga sem mensagem", mode: "guide", state: "applied", expectedRevision: 1, appliedRevision: 2, recordedAt: "x" },
+      ] });
+    expect(items.map((item) => `${item.kind}:${item.value.id}`)).toEqual(["steering:steer-legacy", "message:msg-cmd-1"]);
+  });
+
+  it("places a human approval decision in ledger order, between the message and the action it released", async () => {
+    const { taskActivity: activity } = await import("../../src/ui/presentation.js");
+    const items = activity(snapshot({
+      messages: [{ id: "m1", seq: 1, author: "agent", text: "Vou executar.", recordedAt: "x" }],
+      tools: [{ id: "a1", seq: 5, tool: "exec", target: "", status: "completed", summary: "ok", startedAt: "x", endedAt: "x" } as unknown as TaskSnapshot["tools"][number]],
+      approvalHistory: [{ id: "approval-3", key: "k", seq: 3, tool: "exec", description: "executar: ls", decision: "approved", note: null, recordedAt: "x" }],
+    }));
+    expect(items.map((item) => `${item.kind}:${item.value.id}`)).toEqual(["message:m1", "approval:approval-3", "tool:a1"]);
+  });
+});
+
+describe("criterion labels (PG-025)", () => {
+  it.each([
+    ["directory-exists:TesteMuse", "a pasta “TesteMuse” existe no projeto"],
+    ["file-exists:src/a.txt", "o arquivo “src/a.txt” existe no projeto"],
+    ["directory-listing:files:recursive:.", "listagem completa dos arquivos de “projeto”, incluindo subpastas"],
+    ["directory-listing:all:immediate:docs", "listagem completa das entradas de “docs”"],
+    ["response", "uma resposta do agente"],
+    ["tests-pass", "testes do projeto passando, observados pelo Lattice"],
+    ["unverified", "sua revisão (sem verificação automática)"],
+    ["clarification-required", "um critério mais claro (pedido ambíguo)"],
+    ["custom:thing", "custom:thing"],
+  ])("labels %s in product language", async (criterion, label) => {
+    const { criterionLabel } = await import("../../src/ui/presentation.js");
+    expect(criterionLabel(criterion)).toBe(label);
+  });
+});

@@ -1,4 +1,4 @@
-import { StrictMode, useEffect, useReducer } from "react";
+import { StrictMode, useEffect, useReducer, useRef } from "react";
 import type { JSX } from "react";
 import { createRoot } from "react-dom/client";
 import { createApi } from "./api.js";
@@ -7,31 +7,84 @@ import { Chat, Composer, Detail, Header, HelpView, NewTask, SettingsView, Sideba
 import type { UiEvent } from "../server/protocol.js";
 
 const api = createApi("");
+const LAST_TASK_KEY = "lattice.lastTask";
+const DRAFTS_KEY = "lattice.drafts";
+
+// Per-viewer conveniences only (last open task, unsent drafts): storage may
+// be unavailable or empty, and the UI works the same without it.
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw === null ? fallback : (JSON.parse(raw) as T);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStored(key: string, value: unknown): void {
+  try {
+    if (value === null) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Storage unavailable: nothing to persist, nothing breaks.
+  }
+}
+
+function restoredState(): typeof initialState {
+  // Stored data is untrusted input: keep only string drafts.
+  const drafts = readStored<unknown>(DRAFTS_KEY, {});
+  const safe: Record<string, string> = {};
+  if (typeof drafts === "object" && drafts !== null) {
+    for (const [key, value] of Object.entries(drafts)) if (typeof value === "string") safe[key] = value;
+  }
+  return { ...initialState, drafts: safe, draft: safe["new"] ?? "" };
+}
 
 function TaskView(): JSX.Element {
-  const [state, dispatch] = useReducer(uiReducer, initialState);
+  const [state, dispatch] = useReducer(uiReducer, undefined, restoredState);
+  const restoredLastTask = useRef(false);
 
   useEffect(() => {
     document.getElementById("root")?.removeAttribute("aria-busy");
+    // Phones and narrow windows keep the navigation rail collapsed: it would
+    // otherwise overlay the task. Widening again leaves the choice to the user.
+    const narrow = window.matchMedia("(max-width: 759px)");
+    if (narrow.matches) dispatch({ type: "sidebar", open: false });
+    const onChange = (event: MediaQueryListEvent): void => { if (event.matches) dispatch({ type: "sidebar", open: false }); };
+    narrow.addEventListener("change", onChange);
+    return () => { narrow.removeEventListener("change", onChange); };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     api
-      .sessions()
+      .sessions(state.showArchived === true)
       .then((sessions) => {
         if (!cancelled) {
           dispatch({ type: "sessions", sessions });
           dispatch({ type: "connection", connection: "live" });
+          // Reopen the task that was open before a reload or restart.
+          if (!restoredLastTask.current) {
+            restoredLastTask.current = true;
+            const last = readStored<string | null>(LAST_TASK_KEY, null);
+            if (typeof last === "string" && sessions.some((session) => session.taskId === last)) dispatch({ type: "open-task", taskId: last });
+          }
         }
       })
       .catch(() => {
         if (!cancelled) dispatch({ type: "connection", connection: "error", error: "Não foi possível acessar o servidor local" });
       });
+    // The list also reflects tasks other than the open one (follow-ups,
+    // queued starts, another window): refresh slowly while visible.
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      api.sessions(state.showArchived === true).then((sessions) => { if (!cancelled) dispatch({ type: "sessions", sessions }); }).catch(() => undefined);
+    }, 10_000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [state.activeTaskId, state.task?.state]);
+  }, [state.activeTaskId, state.task?.state, state.sessionsVersion]);
 
   useEffect(() => {
     const taskId = state.activeTaskId;
@@ -62,6 +115,25 @@ function TaskView(): JSX.Element {
       unsubscribe?.();
     };
   }, [state.activeTaskId]);
+
+  useEffect(() => {
+    if (restoredLastTask.current) writeStored(LAST_TASK_KEY, state.activeTaskId);
+  }, [state.activeTaskId]);
+
+  // Header actions outside the reducer's reach (archive) ask for a refresh.
+  useEffect(() => {
+    const stale = (): void => { dispatch({ type: "sessions-stale" }); dispatch({ type: "request-resync" }); };
+    window.addEventListener("lattice:sessions-stale", stale);
+    return () => { window.removeEventListener("lattice:sessions-stale", stale); };
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      const drafts = { ...(state.drafts ?? {}), [state.activeTaskId ?? "new"]: state.draft };
+      writeStored(DRAFTS_KEY, Object.fromEntries(Object.entries(drafts).filter(([, text]) => text.trim() !== "").slice(-50)));
+    }, 300);
+    return () => { window.clearTimeout(timer); };
+  }, [state.draft, state.drafts, state.activeTaskId]);
 
   useEffect(() => {
     if (!state.needsResync || state.activeTaskId === null) return;
@@ -123,7 +195,7 @@ function TaskView(): JSX.Element {
             ) : (
               <>
                 <div className="reading">
-                  <Chat state={state} dispatch={dispatch} />
+                  <Chat api={api} state={state} dispatch={dispatch} />
                 </div>
                 <Composer api={api} state={state} dispatch={dispatch} />
                 {state.actionError && <p className="conn error" role="alert">{state.actionError} <button type="button" className="btn" onClick={() => { dispatch({ type: "clear-action-error" }); }}>Fechar aviso da ação</button></p>}

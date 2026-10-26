@@ -17,6 +17,9 @@ export interface ModelMessage {
   content: string;
   toolCallId?: string;
   toolName?: string;
+  // Assistant turns that requested tools; each id is answered by exactly one
+  // later `tool` message carrying the same toolCallId.
+  toolCalls?: ModelToolCall[];
 }
 
 export interface ModelToolCall {
@@ -65,21 +68,44 @@ export type ProviderErrorKind =
   | "rate-limited"
   | "server-error"
   | "network"
+  // The request provably never left this machine: name resolution,
+  // connection refusal or TLS setup failed before any byte was sent.
+  | "unreachable"
   | "timeout"
   | "aborted"
   | "invalid-request"
   | "unknown";
 
+// What the provider may have done with the request. Only "not-sent" is
+// proof of no remote execution; an error status after delivery can still
+// follow processing (and billing), so anything not provably rejected up
+// front stays "uncertain".
+export type ProviderDelivery = "not-sent" | "uncertain" | "rejected";
+
+export function defaultDelivery(kind: ProviderErrorKind): ProviderDelivery {
+  switch (kind) {
+    case "unreachable":
+      return "not-sent";
+    case "auth":
+    case "invalid-request":
+      return "rejected";
+    default:
+      return "uncertain";
+  }
+}
+
 export class ProviderError extends Error {
   readonly kind: ProviderErrorKind;
   readonly retryable: boolean;
   readonly statusCode: number | null;
-  constructor(kind: ProviderErrorKind, message: string, retryable: boolean, statusCode: number | null = null) {
+  readonly delivery: ProviderDelivery;
+  constructor(kind: ProviderErrorKind, message: string, retryable: boolean, statusCode: number | null = null, delivery: ProviderDelivery = defaultDelivery(kind)) {
     super(message);
     this.name = "ProviderError";
     this.kind = kind;
     this.retryable = retryable;
     this.statusCode = statusCode;
+    this.delivery = delivery;
   }
 }
 

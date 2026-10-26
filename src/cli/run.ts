@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { loadConfig, validateConfig } from "../config.js";
 import { createContract, type TaskContract } from "../runtime/contract.js";
 import {
+  acknowledgeUnknownEffects,
   evaluateResumeGate,
   grantedFromContract,
   openRun,
@@ -13,10 +14,12 @@ import {
   readRunManifest,
   recordTaskEvent,
   recordVerificationEvent,
+  recoverOrphanedTasks,
   resumeTask,
 } from "../runtime/continuity.js";
 import { HandleWaiter } from "../runtime/wait.js";
 import { runTaskLoop, type LoopOptions } from "../runtime/loop.js";
+import { conversationWithLineage } from "../runtime/conversation.js";
 import { claimOwnership, openLatticeDb } from "../storage/db.js";
 import { VerifyLedger } from "../runtime/verify.js";
 import { TaskAcceptance, resolveAcceptance } from "../runtime/acceptance.js";
@@ -47,6 +50,7 @@ export interface RunCommandOptions {
   // Continues a persisted task instead of creating one: the contract,
   // session, budget and composition all come from the ledger.
   resumeTaskId?: string | undefined;
+  acknowledgeUnknown?: boolean | undefined;
 }
 
 const TOOL_OPERATIONS = ["search", "read", "edit", "exec", "process", "model.invoke"];
@@ -174,6 +178,7 @@ function resolveTaskTarget(
       origin: "cli run",
     });
     persistContract(db, contract);
+    recordTaskEvent(db, contract.taskId, "chat", { author: "user", text: options.task, id: `objective-${contract.taskId}` });
     recordTaskEvent(db, contract.taskId, "acceptance-policy", { source: resolution.source, policyVersion: resolution.policyVersion, reason: resolution.reason, revision: contract.revision });
     const { sessionId } = openSession(db, contract.rootId);
     const runId = openRun(db, {
@@ -208,6 +213,8 @@ function resolveTaskTarget(
     emit(`lattice: unknown task ${options.resumeTaskId}`);
     return null;
   }
+  recoverOrphanedTasks(db, ownerGeneration);
+  if (options.acknowledgeUnknown === true) acknowledgeUnknownEffects(db, contract.taskId, { actor: "human (cli)", note: "lattice run --resume --acknowledge-unknown" });
   const gate = evaluateResumeGate(db, { taskId: contract.taskId, generation: ownerGeneration, packageVersion: "0.0.0" });
   if (!gate.canResume) {
     emit(`lattice: resume refused for ${contract.taskId}:`);
@@ -341,6 +348,7 @@ async function runResolvedLoop(
       ...(options.maxIterations === undefined ? {} : { maxIterations: options.maxIterations }),
       acceptanceVerifiers: [(response) => acceptance.check(response?.text), ...(options.verifyExecutable === undefined ? [] : [() => ledger.check()])],
       verifyAfterTools: acceptance.hasFilesystemPredicate,
+      conversation: () => conversationWithLineage(dbRaw, contract.taskId),
       modelRef: { provider, providerId: resolved.providerName, model: resolved.model, endpoint: resolved.baseUrl ?? null },
       waiter,
       beforeRequest: () => { if (acceptance.inventoryInstruction !== null && !taskSurface.obligations.includes(acceptance.inventoryInstruction)) taskSurface.obligations = [...taskSurface.obligations, acceptance.inventoryInstruction]; },

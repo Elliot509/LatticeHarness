@@ -34,6 +34,19 @@ function snapshot(overrides: Partial<TaskSnapshot> = {}): TaskSnapshot {
 }
 
 describe("ui reducer", () => {
+  it("settles a pending message by its durable identity, from an event or a snapshot (PG-011)", () => {
+    let state = uiReducer(initialState, { type: "open-task", taskId: "task-1" });
+    state = uiReducer(state, { type: "snapshot", snapshot: snapshot() });
+    state = uiReducer(state, { type: "command-sent", command: { commandId: "cmd-a", kind: "steer", text: "olá", sentAt: 1 } });
+    state = uiReducer(state, { type: "command-sent", command: { commandId: "cmd-b", kind: "steer", text: "olá", sentAt: 2 } });
+    const message = { id: "msg-cmd-a", seq: 4, author: "user" as const, text: "olá", recordedAt: "2026-10-26T00:00:00Z" };
+    state = uiReducer(state, { type: "event", event: { seq: 4, kind: "message", message } });
+    // Same text, different command: only the acknowledged one settles.
+    expect(state.pending.map((command) => command.commandId)).toEqual(["cmd-b"]);
+    state = uiReducer(state, { type: "snapshot", snapshot: snapshot({ cut: 5, messages: [message, { ...message, id: "msg-cmd-b", seq: 5 }] }) });
+    expect(state.pending).toEqual([]);
+  });
+
   it("refreshes the resume gate after BLOCKED without dropping UNKNOWN or permitting retry", () => {
     let state = uiReducer(initialState, { type: "open-task", taskId: "task-1" });
     state = uiReducer(state, { type: "snapshot", snapshot: snapshot({ resumeBlockers: ["active-runtime"] }) });

@@ -123,6 +123,7 @@ function canonicalPayload(request: ModelRequest): string {
     role: message.role,
     ...(message.toolCallId !== undefined ? { toolCallId: message.toolCallId } : {}),
     ...(message.toolName !== undefined ? { toolName: message.toolName } : {}),
+    ...(message.toolCalls !== undefined ? { toolCalls: message.toolCalls.map((call) => ({ id: call.id, name: call.name, argumentsJson: call.argumentsJson })) } : {}),
   }));
   const tools = [...request.tools]
     .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))

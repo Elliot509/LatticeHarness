@@ -8,7 +8,7 @@ import { stateLabel } from "../../src/ui/state.js";
 import { findChromium, launchChromium, screenshot, type CdpSession } from "./cdp.js";
 
 const UI_ROOT = path.resolve(__dirname, "../../dist/ui");
-const STATES: TaskState[] = ["READY", "RUNNING", "WAITING", "NEEDS_INPUT", "BLOCKED", "COMPLETED", "CANCELLED"];
+const STATES: TaskState[] = ["READY", "RUNNING", "WAITING", "NEEDS_INPUT", "BLOCKED", "COMPLETED", "CANCELLED", "INTERRUPTED"];
 
 function json(response: ServerResponse, body: unknown): void {
   response.writeHead(200, { "Content-Type": "application/json" });
@@ -22,6 +22,7 @@ function toolStatus(state: TaskState): ToolActivityStatus {
     case "BLOCKED":
       return "denied";
     case "CANCELLED":
+    case "INTERRUPTED":
       return "unknown";
     case "READY":
     case "WAITING":
@@ -40,8 +41,9 @@ function snapshot(state: TaskState): TaskSnapshot {
     BLOCKED: "The required credential is not configured.",
     COMPLETED: "All required checks passed.",
     CANCELLED: "Stop confirmed by the runtime.",
+    INTERRUPTED: "The executor ended unexpectedly; effects classified.",
   };
-  const hasUnknown = state === "CANCELLED";
+  const hasUnknown = state === "CANCELLED" || state === "INTERRUPTED";
   return {
     protocol: "ui-1",
     taskId: "task-state",
@@ -63,7 +65,7 @@ function snapshot(state: TaskState): TaskSnapshot {
     waits: state === "WAITING"
       ? [{ waitId: "wait-process", kind: "process", condition: "test process is still running", obligation: "observe the owned process", state: "active" }]
       : [],
-    resumable: state === "WAITING" || state === "BLOCKED" || state === "CANCELLED",
+    resumable: state === "WAITING" || state === "BLOCKED" || state === "CANCELLED" || state === "INTERRUPTED",
     resumeBlockers: state === "BLOCKED" ? ["configure the provider credential"] : [],
     budget: { grantedCalls: 50, grantedTokens: 200000, reservedCalls: state === "RUNNING" ? 1 : 0, reservedTokens: 0, settledCalls: 8, settledTokens: 12400 },
     contextUsage: { known: true, usedTokens: 18300, contextWindow: 128000 },
@@ -155,7 +157,9 @@ describe("browser ui state presentation", () => {
         await waitFor(session, `document.querySelector(".topbar .state")?.textContent === ${JSON.stringify(stateLabel(state))}`);
         const stateView = await session.send<{ result: { value?: unknown } }>("Runtime.evaluate", {
           expression: `(() => ({
-            hasReason: document.querySelector(".task-notices")?.textContent?.includes(${JSON.stringify(snapshot(state).stateReason)}) === true,
+            // The reason may be shown humanized (with the original under
+            // "Detalhes técnicos") or in the running row: anywhere in the task view.
+            hasReason: document.querySelector(".chat")?.textContent?.includes(${JSON.stringify(snapshot(state).stateReason)}) === true,
             hasStop: document.querySelector(".composer .danger") !== null,
             hasResume: [...document.querySelectorAll(".composer button")].some((button) => button.textContent?.trim() === "Retomar"),
             noHorizontalScroll: document.documentElement.scrollWidth <= window.innerWidth,
@@ -165,7 +169,7 @@ describe("browser ui state presentation", () => {
         expect(stateView.result.value).toEqual({
           hasReason: true,
           hasStop: state === "RUNNING" || state === "WAITING",
-          hasResume: state === "WAITING" || state === "BLOCKED" || state === "CANCELLED",
+          hasResume: state === "WAITING" || state === "BLOCKED" || state === "CANCELLED" || state === "INTERRUPTED",
           noHorizontalScroll: true,
         });
         await screenshot(session, path.join(dir, `state-${state.toLowerCase().replace("_", "-")}.png`));

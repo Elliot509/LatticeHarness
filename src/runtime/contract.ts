@@ -34,6 +34,9 @@ export interface TaskContract {
   // evaluated by the authority kernel). Free-text `prohibitions` stay
   // GUIDANCE: rendered to the model, never hard enforcement.
   restrictions?: TypedHardRestrictions | undefined;
+  // Opt-in human confirmation for mutating tools (edit, exec, process
+  // spawn/stdin/stop), enforced at admission (runtime/approval.ts).
+  approvalPolicy?: "none" | "confirm-mutations" | undefined;
   realm: string;
   allowedProvider: string | null;
   allowedModel: string | null;

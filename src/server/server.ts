@@ -9,13 +9,14 @@ import {
   sessionCookieHeader,
   type SessionStore,
 } from "./auth.js";
-import { PROTOCOL_VERSION, type UiCommand } from "./protocol.js";
+import { COMMAND_KINDS, PROTOCOL_VERSION, type UiCommand } from "./protocol.js";
 import { TaskManager } from "./tasks.js";
 import { findPreset, isKnownProviderId, listPresets } from "../providers/presets.js";
 import { testConnection } from "../providers/discovery.js";
 import { loadProductConfig, parseProductConfig, saveProductConfig } from "../productConfig.js";
 
 import { normalizeEndpoint } from "../providers/endpoint.js";
+import { resolveAcceptance } from "../runtime/acceptance.js";
 
 const MAX_COMMAND_BYTES = 64 * 1024;
 const HEARTBEAT_MS = 25_000;
@@ -25,6 +26,7 @@ function contentType(filePath: string): string {
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
   if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".svg")) return "image/svg+xml";
   return "application/octet-stream";
 }
 
@@ -82,7 +84,7 @@ function parseCommand(body: string): UiCommand {
   if (typeof parsed.commandId !== "string" || parsed.commandId === "") {
     throw new Error("commandId is required");
   }
-  const kinds = ["create-task", "follow-up-task", "start-task", "steer", "stop", "select-model", "set-key", "resume-task", "wake"];
+  const kinds: readonly string[] = COMMAND_KINDS;
   if (typeof parsed.kind !== "string" || !kinds.includes(parsed.kind)) {
     throw new Error("unknown command kind");
   }
@@ -245,7 +247,17 @@ async function handle(
 
   if (request.method === "GET" && url.pathname === "/api/sessions") {
     response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(JSON.stringify({ protocol: PROTOCOL_VERSION, sessions: tasks.listSessions() }));
+    response.end(JSON.stringify({ protocol: PROTOCOL_VERSION, sessions: tasks.listSessions(url.searchParams.get("archived") === "1") }));
+    return;
+  }
+
+  // What the runtime will require to call a request done, before it exists.
+  // Read-only; the contract is still resolved again when the task is created.
+  if (request.method === "GET" && url.pathname === "/api/acceptance-preview") {
+    const objective = url.searchParams.get("objective") ?? "";
+    const resolution = resolveAcceptance(objective.slice(0, 4000));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ protocol: PROTOCOL_VERSION, criteria: resolution.criteria, reason: resolution.reason }));
     return;
   }
 
@@ -436,7 +448,7 @@ async function handle(
     return;
   }
 
-  const taskMatch = /^\/api\/tasks\/([^/]+)\/(snapshot|events|tool)$/.exec(url.pathname);
+  const taskMatch = /^\/api\/tasks\/([^/]+)\/(snapshot|events|tool|file)$/.exec(url.pathname);
   if (request.method === "GET" && taskMatch?.[1] !== undefined && taskMatch[2] !== undefined) {
     const taskId = decodeURIComponent(taskMatch[1]);
     if (taskMatch[2] === "snapshot") {
@@ -462,6 +474,19 @@ async function handle(
           streams.delete(response);
         });
       }
+      return;
+    }
+    if (taskMatch[2] === "file") {
+      let fileBody: string;
+      try {
+        fileBody = JSON.stringify(tasks.filePreview(taskId, url.searchParams.get("path") ?? ""));
+      } catch (error) {
+        response.writeHead(404, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: error instanceof Error ? error.message : "file unavailable" }));
+        return;
+      }
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(fileBody);
       return;
     }
     const toolId = url.searchParams.get("id") ?? "";

@@ -27,7 +27,7 @@ describe("bounded filesystem acceptance, independently of explicit criteria", ()
     ["Create folder ./Python", "directory-exists:./Python"],
   ])("maps only the complete objective: %s", (objective, criterion) => {
     expect(defaultAcceptance(objective)).toEqual([criterion]);
-    expect(resolveAcceptance(objective)).toMatchObject({ criteria: [criterion], source: "default", policyVersion: "acceptance-3" });
+    expect(resolveAcceptance(objective)).toMatchObject({ criteria: [criterion], source: "default", policyVersion: "acceptance-4" });
   });
 
   it.each([
@@ -54,8 +54,19 @@ describe("bounded filesystem acceptance, independently of explicit criteria", ()
     expect(defaultAcceptance(objective)).toEqual(["clarification-required"]);
   });
 
-  it.each(["Fix a bug and create directory Muse", "Corrija o código e execute testes", "Implemente a API Python"])("keeps coding verification for %s", objective => {
+  it.each(["Corrija o código e execute testes", "Fix a bug and run tests", "Faça os testes passarem"])("requires observed passing tests when the request names tests: %s", objective => {
     expect(defaultAcceptance(objective)).toEqual(["tests-pass"]);
+  });
+
+  // acceptance-4 (PG-006, errata E-06): a change no generic predicate can
+  // certify ends awaiting human review; it is never concluded by model text
+  // and no longer demands tests the request never mentioned.
+  it.each(["Fix a bug and create directory Muse", "Implemente a API Python", "Corrija o bug do desconto em src/sum.js", "Organize os arquivos", "Pode corrigir o bug?", "Explique o erro e corrija o programa"])("awaits human review for %s", objective => {
+    expect(defaultAcceptance(objective)).toEqual(["unverified"]);
+  });
+
+  it.each(["E como corrijo isso?", "Qual é o problema em a.txt?", "Por que o teste falha?", "Você pode explicar o README?", "Explique a alternativa"])("treats questions and explanations as answer deliverables: %s", objective => {
+    expect(defaultAcceptance(objective)).toEqual(["response"]);
   });
 
   it("preserves explicit criteria verbatim, including when automatic recognition would refuse", () => {

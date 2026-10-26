@@ -6,7 +6,7 @@ import {
   type ProviderAdapter,
 } from "./types.js";
 
-export const OPENAI_ADAPTER_REVISION = "openai-chat-completions-3";
+export const OPENAI_ADAPTER_REVISION = "openai-chat-completions-4";
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
 export interface OpenAiAdapterOptions {
@@ -88,7 +88,7 @@ export class OpenAiAdapter implements ProviderAdapter {
 
   async complete(request: ModelRequest): Promise<ModelResponse> {
     if (request.signal?.aborted === true) {
-      throw new ProviderError("aborted", "OpenAI request aborted before dispatch", false);
+      throw new ProviderError("aborted", "Provider request aborted before dispatch", false, null, "not-sent");
     }
     const controller = new AbortController();
     const state = { timedOut: false };
@@ -114,13 +114,20 @@ export class OpenAiAdapter implements ProviderAdapter {
             model: request.model,
             messages: [
               { role: "system", content: request.system },
-              ...request.messages.map((message) => ({
-                role: message.role,
-                content: message.content,
-                ...(message.toolCallId !== undefined
-                  ? { tool_call_id: message.toolCallId }
-                  : {}),
-              })),
+              ...request.messages.map((message) => message.role === "assistant" && message.toolCalls !== undefined && message.toolCalls.length > 0
+                ? {
+                    role: "assistant",
+                    // Spec: content may be null when tool_calls is present.
+                    content: message.content === "" ? null : message.content,
+                    tool_calls: message.toolCalls.map((call) => ({ id: call.id, type: "function", function: { name: call.name, arguments: call.argumentsJson } })),
+                  }
+                : {
+                    role: message.role,
+                    content: message.content,
+                    ...(message.toolCallId !== undefined
+                      ? { tool_call_id: message.toolCallId }
+                      : {}),
+                  }),
             ],
             tools: request.tools.map((tool) => ({
               type: "function",
@@ -137,14 +144,16 @@ export class OpenAiAdapter implements ProviderAdapter {
           }),
           signal: controller.signal,
         });
-      } catch {
+      } catch (error) {
+        const connectFailure = connectPhaseFailure(error);
         if (controller.signal.aborted) {
           throw new ProviderError(
             state.timedOut ? "timeout" : "aborted",
-            state.timedOut ? "OpenAI request timed out" : "OpenAI request aborted",
+            state.timedOut ? "Provider request timed out" : "Provider request aborted while in flight",
             state.timedOut,
           );
         }
+        if (connectFailure !== null) throw new ProviderError("unreachable", `Provider endpoint unreachable (${connectFailure}); request not sent`, true, null, "not-sent");
         throw new ProviderError("network", "Provider network request failed", true);
       }
       if (!httpResponse.ok) {
@@ -168,26 +177,54 @@ export class OpenAiAdapter implements ProviderAdapter {
   }
 }
 
+// Error codes that can only occur before the request body is transmitted:
+// resolution, connection establishment and TLS handshake. Resets and socket
+// closes are excluded on purpose: they can happen after the request was sent.
+const CONNECT_PHASE_CODES = new Set([
+  "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOTAVAIL",
+  "UND_ERR_CONNECT_TIMEOUT", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "ERR_TLS_CERT_ALTNAME_INVALID",
+]);
+
+export function connectPhaseFailure(error: unknown): string | null {
+  const seen = new Set<unknown>();
+  const visit = (value: unknown): string | null => {
+    if (value === null || typeof value !== "object" || seen.has(value)) return null;
+    seen.add(value);
+    const record = value as { code?: unknown; cause?: unknown; errors?: unknown; message?: unknown };
+    if (typeof record.code === "string" && CONNECT_PHASE_CODES.has(record.code)) return record.code;
+    // Fetch refuses ports on its blocklist before opening any connection.
+    if (record.code === undefined && record.message === "bad port") return "blocked port";
+    if (Array.isArray(record.errors)) {
+      // Happy-eyeballs: every address must have failed to connect.
+      const codes = record.errors.map(visit);
+      if (codes.length > 0 && codes.every((code) => code !== null)) return codes[0] ?? null;
+    }
+    return visit(record.cause);
+  };
+  return visit(error);
+}
+
 function normalizeResponse(body: ChatCompletionsResponse): ModelResponse {
   const choice = body.choices?.[0];
   if (choice === undefined) {
-    throw new ProviderError("unknown", "OpenAI response contained no choices", false);
+    throw new ProviderError("unknown", "Provider response contained no choices", false);
   }
   const message = choice.message;
   if (message === undefined) {
-    throw new ProviderError("unknown", "OpenAI response choice contained no message", false);
+    throw new ProviderError("unknown", "Provider response choice contained no message", false);
   }
   const toolCalls = (message.tool_calls ?? []).map((call, index) => {
     if (call.type !== undefined && call.type !== "function") {
       throw new ProviderError(
         "unknown",
-        `Unsupported OpenAI tool call type at index ${index}`,
+        `Unsupported tool call type at index ${index}`,
         false,
       );
     }
     const name = call.function?.name;
     if (typeof name !== "string" || name === "") {
-      throw new ProviderError("unknown", `OpenAI tool call at index ${index} has no name`, false);
+      throw new ProviderError("unknown", `Tool call at index ${index} has no name`, false);
     }
     const id = typeof call.id === "string" && call.id !== "" ? call.id : `openai-call-${index}`;
     const args = call.function?.arguments;

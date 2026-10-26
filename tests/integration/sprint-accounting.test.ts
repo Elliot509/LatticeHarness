@@ -46,7 +46,8 @@ describe("sprint accounting protocol", () => {
       fs.writeFileSync(path.join(f.workspace, "exists"), "real content");
       f.options.tools = buildToolset().filter(tool => tool.name === "read");
       expect(await runTaskLoop(f.options)).toMatchObject({ decision: "STOP", modelCalls: 3, toolDispatches: 2 });
-      expect(f.provider.requests[2]?.messages[0]?.content).toContain("real content");
+      // Surface-2: the corrected read's result arrives as a tool message.
+      expect(f.provider.requests[2]?.messages.map((message) => message.content).join("\n")).toContain("real content");
     } finally { f.opened.close(); }
   });
   it("finishes productive work beyond 50 calls and 200k tokens with bounded recent context", async () => {
@@ -60,10 +61,13 @@ describe("sprint accounting protocol", () => {
       expect(fs.readFileSync(path.join(f.workspace, "result-59"), "utf8")).toBe("observed 59");
       expect(taskBudgetSnapshot(f.opened.raw, "t", { calls: null, tokens: null }).settled.tokens).toBe(305_000);
       for (const request of f.provider.requests) {
-        expect(request.messages).toHaveLength(1);
-        expect(request.system.length + (request.messages[0]?.content.length ?? 0)).toBeLessThanOrEqual(3000);
+        const chars = request.system.length + request.messages.reduce((sum, message) => sum + message.content.length + (message.toolCalls ?? []).reduce((calls, call) => calls + call.id.length + call.name.length + call.argumentsJson.length, 0), 0);
+        expect(chars).toBeLessThanOrEqual(3000);
+        // Bounded recent context never splits a call from its result.
+        const ids = new Set(request.messages.flatMap((message) => (message.toolCalls ?? []).map((call) => call.id)));
+        for (const message of request.messages) if (message.role === "tool") expect(ids.has(message.toolCallId ?? "")).toBe(true);
       }
-      expect(f.provider.requests.at(-1)?.messages[0]?.content).toContain("omitidos por limite");
+      expect(f.provider.requests.at(-1)?.system).toContain("omitidos por limite");
     } finally { f.opened.close(); }
   });
 

@@ -1,7 +1,7 @@
 // P0 Electron main: owns window lifecycle and supervises the packaged
 // backend utility process over a typed handshake. Task execution, storage
 // and HTTP/SSE stay in the backend; the renderer loads the compiled UI.
-import { app, BrowserWindow, dialog, ipcMain, utilityProcess } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell, utilityProcess } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { DESKTOP_BACKEND_PROTOCOL, SELECT_PROJECT_CHANNEL } from "./protocol.js";
@@ -197,7 +197,12 @@ async function createWindow(): Promise<void> {
     event.preventDefault();
     void requestQuit();
   });
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  // No new Electron windows ever. Links from responses (target=_blank) open
+  // in the system browser, and only for http(s) and mailto.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (externalLinkAllowed(url)) void shell.openExternal(url);
+    return { action: "deny" };
+  });
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (backend === null || new URL(url).origin !== new URL(backend.url).origin) event.preventDefault();
   });
@@ -205,6 +210,14 @@ async function createWindow(): Promise<void> {
   const separator = pair.indexOf("=");
   await mainWindow.webContents.session.cookies.set({ url: backend.url, name: pair.slice(0, separator), value: pair.slice(separator + 1), httpOnly: true, sameSite: "strict", path: "/" });
   await mainWindow.loadURL(backend.url);
+}
+
+export function externalLinkAllowed(url: string): boolean {
+  try {
+    return ["http:", "https:", "mailto:"].includes(new URL(url).protocol);
+  } catch {
+    return false;
+  }
 }
 
 function projectSelectionAvailable(current: BackendHandle): boolean { return backend === current && !quitting && !closePending; }
@@ -225,7 +238,21 @@ ipcMain.handle(SELECT_PROJECT_CHANNEL, async (event) => {
 
 app.setAppUserModelId(LATTICE_APP_ID);
 
-app.whenReady().then(
+// One instance per profile (PG-045): a second launch focuses the existing
+// window instead of racing it for the same database ownership.
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) {
+  process.stdout.write("lattice desktop: another instance owns this profile; focusing it\n");
+  app.exit(0);
+}
+app.on("second-instance", () => {
+  if (mainWindow === null) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+
+if (primaryInstance) app.whenReady().then(
   () => {
     createWindow().catch((error: unknown) => {
       process.stderr.write(`lattice desktop failed to start: ${error instanceof Error ? error.message : "unknown error"}\n`);

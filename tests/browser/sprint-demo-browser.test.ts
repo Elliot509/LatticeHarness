@@ -12,7 +12,7 @@ import { saveProductConfig } from "../../src/productConfig.js";
 import { launchChromium } from "./cdp.js";
 
 describe("fresh Friday UI workflow", () => {
-  it("opens the one created task and shows an action error when another task prevents start", async () => {
+  it("opens the one created task and shows it queued while another task runs (PG-013)", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lattice-start-denial-"));
     const workspace = path.join(dir, "ws"); fs.mkdirSync(workspace);
     const db = openLatticeDb(path.join(dir, "data")); claimOwnership(db.raw);
@@ -32,7 +32,8 @@ describe("fresh Friday UI workflow", () => {
       await waitFor(browser.session, `document.querySelector('.newtask-modelbtn')?.textContent.includes('fixture') === true`);
       await evaluate(browser.session, `(() => { const e=document.querySelector('#new-task-objective'); Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(e,'Create directory second'); e.dispatchEvent(new Event('input',{bubbles:true})); })()`);
       await evaluate(browser.session, `document.querySelector('button[aria-label="Iniciar tarefa"]').click()`);
-      await waitFor(browser.session, `document.querySelector('.topbar')?.textContent.includes('Pronto') === true && document.querySelector('[role=alert]')?.textContent.includes('execução não foi aceita') === true`);
+      await waitFor(browser.session, `document.querySelector('.topbar')?.textContent.includes('Na fila') === true && document.querySelector('.task-notices')?.textContent.includes('começa sozinha') === true`);
+      expect(await evaluate(browser.session, `[...document.querySelectorAll('.composer button')].some((b) => b.textContent === 'Tirar da fila')`)).toBe(true);
       expect(db.raw.prepare("SELECT COUNT(*) AS n FROM contracts").get()).toMatchObject({ n: 2 });
       expect(await evaluate(browser.session, `document.querySelector('.newtask') === null`)).toBe(true);
     } finally {

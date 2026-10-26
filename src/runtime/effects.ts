@@ -1,6 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
+import { resolveInScope } from "../platform/paths.js";
 import {
   admitIntent,
   claimTicket,
@@ -388,8 +390,11 @@ export function claimDurable(
     db.prepare("UPDATE intents SET state = 'CLAIMED' WHERE intent_id = (SELECT intent_id FROM attempts WHERE attempt_id = ?)").run(
       attemptId,
     );
+    // dispatchMarker: this claim follows the dispatch-marker protocol, so a
+    // missing dispatchStartedAt after a crash proves the executor never
+    // started the effect (see markDispatching / classifyUnfinishedIntents).
     db.prepare("UPDATE attempts SET ticket = ? WHERE attempt_id = ?").run(
-      JSON.stringify({ ...ticket, claimed: true }),
+      JSON.stringify({ ...ticket, claimed: true, dispatchMarker: true }),
       attemptId,
     );
     db.exec("COMMIT");
@@ -403,6 +408,27 @@ export function claimDurable(
   }
   throwIfFault("after-claim");
   return { claimed: true };
+}
+
+// Durable "about to dispatch" marker, committed after the claim and
+// immediately before the provider request or tool execution starts. Crash
+// boundary: a claimed attempt WITHOUT this marker provably never reached the
+// network or the tool; WITH it, the effect may have happened (UNKNOWN).
+export function markDispatching(db: DatabaseSync, attemptId: string, now: Date = new Date()): void {
+  guardWrites("markDispatching");
+  db.prepare("UPDATE attempts SET ticket = json_set(ticket, '$.dispatchStartedAt', ?) WHERE attempt_id = ? AND state = 'CLAIMED'").run(now.toISOString(), attemptId);
+}
+
+export function dispatchEvidence(db: DatabaseSync, attemptId: string): "dispatched" | "not-dispatched" | "unknown" {
+  const row = db.prepare("SELECT ticket FROM attempts WHERE attempt_id = ?").get(attemptId) as { ticket: string } | undefined;
+  if (row === undefined) return "unknown";
+  try {
+    const ticket = JSON.parse(row.ticket) as { dispatchMarker?: unknown; dispatchStartedAt?: unknown };
+    if (ticket.dispatchMarker !== true) return "unknown";
+    return typeof ticket.dispatchStartedAt === "string" ? "dispatched" : "not-dispatched";
+  } catch {
+    return "unknown";
+  }
 }
 
 // Invalidates an ADMITTED intent that was never claimed (crash boundary B):
@@ -638,17 +664,18 @@ export function reconcileEditAttempt(
     .prepare("SELECT detail FROM receipts WHERE attempt_id = ?")
     .get(attemptId) as { detail: string } | undefined;
   const afterVersion = receipt !== undefined ? receiptEffectVersions(receipt.detail).afterVersion : null;
+  const taskId = intentTask(db, row.intent_id);
   if (afterVersion !== null && observedVersion === afterVersion) {
-    closeReconciliation(db, row.intent_id, attemptId, "applied", `effect present at ${observedVersion}`);
+    closeReconciliation(db, row.intent_id, attemptId, "applied", `effect present at ${observedVersion}`, taskId);
     return { result: "applied", detail: `effect present at ${observedVersion}` };
   }
   if (args.expectedVersion !== undefined && observedVersion === args.expectedVersion) {
-    closeReconciliation(db, row.intent_id, attemptId, "not-applied", `no effect at ${observedVersion}; safe to readmit`);
+    closeReconciliation(db, row.intent_id, attemptId, "not-applied", `no effect at ${observedVersion}; safe to readmit`, taskId);
     return { result: "not-applied", detail: `no effect at ${observedVersion}; safe to readmit` };
   }
   db.prepare(`INSERT INTO events (kind, task_id, payload, recorded_at) VALUES (?, ?, ?, ?)`).run(
     "reconciliation.conflict",
-    null,
+    taskId,
     JSON.stringify({ attemptId, observedVersion }),
     new Date().toISOString(),
   );
@@ -658,19 +685,201 @@ export function reconcileEditAttempt(
   };
 }
 
+function intentTask(db: DatabaseSync, intentId: string): string | null {
+  const row = db.prepare("SELECT task_id FROM intents WHERE intent_id = ?").get(intentId) as { task_id: string } | undefined;
+  return row?.task_id ?? null;
+}
+
+// Possibly-consumed accounting: what is still reserved by UNKNOWN intents.
+// A remote call that may have been processed keeps counting against the
+// budget; presenting it separately keeps "possible" from reading as zero or
+// as an ordinary in-flight reservation.
+export function uncertainReservationTotals(db: DatabaseSync, taskId: string): { calls: number; tokens: number } {
+  const row = db
+    .prepare(
+      `SELECT COALESCE(SUM(r.calls - r.settled_calls), 0) AS calls,
+              COALESCE(SUM(r.tokens - r.settled_tokens), 0) AS tokens
+       FROM reservations r JOIN intents i ON i.intent_id = r.intent_id
+       WHERE r.state = 'open' AND i.task_id = ? AND i.state = 'UNKNOWN'`,
+    )
+    .get(taskId) as { calls: number; tokens: number };
+  return { calls: row.calls, tokens: row.tokens };
+}
+
+export type ReconcileDecision = "observe" | "treat-as-applied" | "treat-as-not-applied";
+
+export interface ReconcileOutcome {
+  attemptId: string;
+  operation: string;
+  result: "applied" | "not-applied" | "inert" | "conflict" | "human-applied" | "human-not-applied" | "not-reconcilable";
+  reconciled: boolean;
+  detail: string;
+}
+
+function fileState(workspaceRoot: string, relative: string | undefined): { kind: "absent" } | { kind: "file"; version: string } | { kind: "unobservable"; detail: string } {
+  if (typeof relative !== "string" || relative === "") return { kind: "unobservable", detail: "edit plan names no path" };
+  const absolute = resolveInScope(workspaceRoot, relative);
+  if (absolute === null) return { kind: "unobservable", detail: `${relative} resolves outside the workspace` };
+  try {
+    const stat = fs.lstatSync(absolute);
+    if (!stat.isFile()) return { kind: "unobservable", detail: `${relative} is not a regular file` };
+    return { kind: "file", version: `sha256:${createHash("sha256").update(fs.readFileSync(absolute)).digest("hex").slice(0, 16)}` };
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+    return code === "ENOENT" ? { kind: "absent" } : { kind: "unobservable", detail: `${relative} could not be read` };
+  }
+}
+
+function describeState(state: ReturnType<typeof fileState>): string {
+  return state.kind === "file" ? state.version : state.kind === "absent" ? "absent" : `unobservable (${state.detail})`;
+}
+
+// Observation-based classification of an UNKNOWN edit, for every kind. The
+// final state matching the plan proves the desired state, not authorship;
+// anything that matches neither the precondition nor the plan is a conflict
+// that only a human may decide.
+function observeEdit(argsJson: string | undefined, afterVersion: string | null, workspaceRoot: string): { result: "applied" | "not-applied" | "conflict"; detail: string } {
+  let args: { kind?: unknown; path?: unknown; content?: unknown; expectedVersion?: unknown; newPath?: unknown; oldText?: unknown; newText?: unknown };
+  try {
+    args = argsJson !== undefined ? (JSON.parse(argsJson) as typeof args) : {};
+  } catch {
+    return { result: "conflict", detail: "attempt carries no parseable edit plan" };
+  }
+  const target = typeof args.path === "string" ? args.path : undefined;
+  const expected = typeof args.expectedVersion === "string" ? args.expectedVersion : null;
+  const current = fileState(workspaceRoot, target);
+  if (current.kind === "unobservable") return { result: "conflict", detail: current.detail };
+  switch (args.kind) {
+    case "create": {
+      if (current.kind === "absent") return { result: "not-applied", detail: `${target} absent; create not applied` };
+      const planned = typeof args.content === "string" ? `sha256:${createHash("sha256").update(args.content, "utf8").digest("hex").slice(0, 16)}` : null;
+      return current.version === planned
+        ? { result: "applied", detail: `${target} present with the planned content ${current.version}` }
+        : { result: "conflict", detail: `${target} exists with ${current.version}, not the planned content` };
+    }
+    case "delete":
+      if (current.kind === "absent") return { result: "applied", detail: `${target} absent; delete effect present` };
+      return current.version === expected
+        ? { result: "not-applied", detail: `${target} unchanged at ${current.version}; delete not applied` }
+        : { result: "conflict", detail: `${target} at ${current.version} matches neither the precondition nor deletion` };
+    case "rename": {
+      const destination = fileState(workspaceRoot, typeof args.newPath === "string" ? args.newPath : undefined);
+      if (destination.kind === "unobservable") return { result: "conflict", detail: destination.detail };
+      if (current.kind === "absent" && destination.kind === "file" && destination.version === expected) return { result: "applied", detail: `content ${expected} now at ${String(args.newPath)}` };
+      if (current.kind === "file" && current.version === expected && destination.kind === "absent") return { result: "not-applied", detail: `${target} unchanged at ${current.version}; rename not applied` };
+      return { result: "conflict", detail: `source ${describeState(current)}, destination ${describeState(destination)}` };
+    }
+    default:
+      if (current.kind === "file" && current.version === expected) return { result: "not-applied", detail: `${target} unchanged at ${current.version}; safe to readmit` };
+      if (current.kind === "file" && afterVersion !== null && current.version === afterVersion) return { result: "applied", detail: `effect present at ${current.version}` };
+      if (current.kind === "file" && expected !== null && typeof args.oldText === "string" && typeof args.newText === "string"
+        && replacementReverts(workspaceRoot, target, args.oldText, args.newText, expected)) {
+        return { result: "applied", detail: `${target} at ${current.version} is exactly the precondition ${expected} with the planned replacement applied` };
+      }
+      return { result: "conflict", detail: `${target} is ${describeState(current)}; matches neither the precondition nor a recorded result` };
+  }
+}
+
+// Proof for a replace without a receipt: undoing the planned replacement at
+// some occurrence of newText yields bytes whose version is exactly the
+// precondition. Only then is the current file "precondition + this edit".
+function replacementReverts(workspaceRoot: string, relative: string | undefined, oldText: string, newText: string, expected: string): boolean {
+  if (newText === "" || typeof relative !== "string") return false;
+  const absolute = resolveInScope(workspaceRoot, relative);
+  if (absolute === null) return false;
+  let content: string;
+  try {
+    content = fs.readFileSync(absolute, "utf8");
+  } catch {
+    return false;
+  }
+  for (let index = content.indexOf(newText); index !== -1; index = content.indexOf(newText, index + 1)) {
+    const reverted = content.slice(0, index) + oldText + content.slice(index + newText.length);
+    if (`sha256:${createHash("sha256").update(reverted, "utf8").digest("hex").slice(0, 16)}` === expected) return true;
+  }
+  return false;
+}
+
+// Reconciles one UNKNOWN attempt of a task, by operation:
+// - read/search have no mutating effect: reconciled as inert;
+// - edit is reconciled by observing the disk against its plan;
+// - exec/process cannot be proven by local observation: only an explicit,
+//   recorded human decision closes them;
+// - model.invoke is never reconciled here: a remote call may have been
+//   processed and billed; it stays UNKNOWN and its reservation stays counted.
+// Every outcome is an event with provenance; the UNKNOWN receipt stays.
+export function reconcileUnknownAttempt(
+  db: DatabaseSync,
+  taskId: string,
+  attemptId: string,
+  workspaceRoot: string,
+  decision: ReconcileDecision = "observe",
+  actor = "human",
+  note: string | null = null,
+): ReconcileOutcome {
+  const row = db
+    .prepare(
+      `SELECT a.intent_id, a.ticket, a.state AS attempt_state, i.state AS intent_state, i.operation
+       FROM attempts a JOIN intents i ON i.intent_id = a.intent_id WHERE a.attempt_id = ? AND i.task_id = ?`,
+    )
+    .get(attemptId, taskId) as { intent_id: string; ticket: string; attempt_state: string; intent_state: string; operation: string } | undefined;
+  if (row === undefined) return { attemptId, operation: "unknown", result: "not-reconcilable", reconciled: false, detail: `attempt ${attemptId} does not belong to task ${taskId}` };
+  const base = { attemptId, operation: row.operation };
+  if (row.intent_state !== "UNKNOWN" && row.attempt_state !== "UNKNOWN") {
+    return { ...base, result: "not-reconcilable", reconciled: false, detail: `attempt is ${row.attempt_state}, not UNKNOWN` };
+  }
+  if (row.operation === "model.invoke") {
+    return { ...base, result: "not-reconcilable", reconciled: false, detail: "a remote model call cannot be observed locally; it may have been processed and billed. Acknowledge it to continue; its reservation stays counted as possible consumption" };
+  }
+  if (decision !== "observe") {
+    if (row.operation === "read" || row.operation === "search") {
+      closeReconciliation(db, row.intent_id, attemptId, "inert", "non-mutating operation", taskId);
+      return { ...base, result: "inert", reconciled: true, detail: "non-mutating operation; nothing to reconcile" };
+    }
+    const result = decision === "treat-as-applied" ? "human-applied" : "human-not-applied";
+    closeReconciliation(db, row.intent_id, attemptId, "human", `${actor} decided: ${decision}${note === null ? "" : ` (${note})`}`, taskId, { decision, actor, note });
+    return { ...base, result, reconciled: true, detail: `recorded human decision: ${decision}` };
+  }
+  if (row.operation === "read" || row.operation === "search") {
+    closeReconciliation(db, row.intent_id, attemptId, "inert", "non-mutating operation", taskId);
+    return { ...base, result: "inert", reconciled: true, detail: "non-mutating operation; nothing to reconcile" };
+  }
+  if (row.operation === "edit") {
+    let argsJson: string | undefined;
+    try {
+      const ticket = JSON.parse(row.ticket) as { args?: unknown };
+      argsJson = typeof ticket.args === "string" ? ticket.args : undefined;
+    } catch {
+      argsJson = undefined;
+    }
+    const receipt = db.prepare("SELECT detail FROM receipts WHERE attempt_id = ?").get(attemptId) as { detail: string } | undefined;
+    const observed = observeEdit(argsJson, receipt !== undefined ? receiptEffectVersions(receipt.detail).afterVersion : null, workspaceRoot);
+    if (observed.result === "conflict") {
+      db.prepare("INSERT INTO events (kind, task_id, payload, recorded_at) VALUES (?, ?, ?, ?)").run(
+        "reconciliation.conflict", taskId, JSON.stringify({ attemptId, detail: observed.detail }), new Date().toISOString());
+      return { ...base, result: "conflict", reconciled: false, detail: `${observed.detail}; human decision required` };
+    }
+    closeReconciliation(db, row.intent_id, attemptId, observed.result, observed.detail, taskId);
+    return { ...base, result: observed.result, reconciled: true, detail: observed.detail };
+  }
+  return { ...base, result: "not-reconcilable", reconciled: false, detail: "process effects cannot be proven by local observation; inspect the workspace and record a decision" };
+}
+
 function closeReconciliation(
   db: DatabaseSync,
   intentId: string,
   attemptId: string,
-  result: "applied" | "not-applied",
+  result: "applied" | "not-applied" | "inert" | "human",
   detail: string,
+  taskId: string | null = null,
+  extra: Record<string, unknown> = {},
 ): void {
   db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare(`INSERT INTO events (kind, task_id, payload, recorded_at) VALUES (?, ?, ?, ?)`).run(
       `reconciliation.${result}`,
-      null,
-      JSON.stringify({ attemptId, detail }),
+      taskId,
+      JSON.stringify({ attemptId, detail, ...extra }),
       new Date().toISOString(),
     );
     db.prepare(`UPDATE intents SET state = 'RECONCILED' WHERE intent_id = ?`).run(intentId);

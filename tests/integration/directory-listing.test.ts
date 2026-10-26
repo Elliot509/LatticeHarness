@@ -10,6 +10,11 @@ import { TaskAcceptance, defaultAcceptance, resolveAcceptance } from "../../src/
 import { ReadTool } from "../../src/tools/read.js";
 import { buildToolset } from "../../src/tools/registry.js";
 
+// Surface-2: anchors are in the system message, observations in tool turns.
+function modelText(request: { system: string; messages: Array<{ content: string }> } | undefined): string {
+  return request === undefined ? "" : [request.system, ...request.messages.map((message) => message.content)].join("\n");
+}
+
 const objective = "Me liste tudo que está nessa pasta.";
 const usage = { inputTokens: 1200, outputTokens: 50, inclusiveInput: true };
 const dirs: string[] = [];
@@ -32,9 +37,9 @@ describe("bounded informational acceptance", () => {
     ["Liste tudo nessa pasta recursivamente.", "directory-listing:all:recursive:."],
     ["Leia README.md e explique o conteúdo.", "response"],
     ["Resuma a estrutura desse projeto.", "response"],
-    ["Corrija a API e explique o resultado", "tests-pass"],
-    ["Liste os arquivos aqui e crie um programa", "tests-pass"],
-    ["Explique o erro e corrija o programa", "tests-pass"],
+    ["Corrija a API e explique o resultado", "unverified"],
+    ["Liste os arquivos aqui e crie um programa", "unverified"],
+    ["Explique o erro e corrija o programa", "unverified"],
     ["Liste tudo na pasta Downloads", "clarification-required"],
   ])("preserves the whole obligation: %s", (text, criterion) => { expect(defaultAcceptance(text)).toEqual([criterion]); });
   it("keeps explicit criteria independent", () => { expect(resolveAcceptance(objective, ["response", "tests-pass"])).toMatchObject({ criteria: ["response", "tests-pass"], source: "explicit" }); });
@@ -133,7 +138,7 @@ describe("directory pages and verified delivery", () => {
       expect(f.tasks.snapshot(taskId)).toMatchObject({ state: "COMPLETED", acceptanceCriteria: ["directory-listing:all:immediate:."] });
       expect(provider.requests).toHaveLength(1); expect(provider.remainingSteps).toBe(13);
       expect(provider.requests[0]?.tools.map(tool => tool.name)).toEqual(["read"]);
-      expect(provider.requests[0]?.messages[0]?.content).toContain("nextCursor");
+      expect(modelText(provider.requests[0])).toContain("nextCursor");
       const chats = f.db.raw.prepare("SELECT payload FROM events WHERE kind='chat'").all().map(row => JSON.parse(String(row["payload"])) as { text: string });
       expect(chats.at(-1)?.text).toContain('"Python" [directory]'); expect(chats.at(-1)?.text).toContain('"README.md" [file]');
     } finally { await f.tasks.close(); f.db.close(); }
@@ -146,7 +151,7 @@ describe("directory pages and verified delivery", () => {
     const f = fixture(); for (let i = 0; i < 120; i++) fs.writeFileSync(path.join(f.root, `item-${String(i).padStart(3, "0")}`), "");
     const requests: ModelRequest[] = [];
     const provider: ProviderAdapter = { name: "fake", adapterRevision: "directory-fixture-1", complete: async request => {
-      requests.push(request); const text = request.messages[0]?.content ?? "";
+      requests.push(request); const text = modelText(request);
       const cursor = [...text.matchAll(/cursor=([a-f0-9-]{36}:\d+)/gu)].at(-1)?.[1];
       return { text: "", toolCalls: [{ id: `page-${requests.length}`, ...read({ pageSize: 5, ...(cursor === undefined ? {} : { cursor }) }) }], usage, modelResolved: "fixture", providerRequestId: null };
     } };
@@ -215,7 +220,9 @@ describe("directory pages and verified delivery", () => {
   it("real shell writes do not satisfy tests-pass through exit zero", async () => {
     const f = fixture();
     try {
-      const { taskId } = f.tasks.createTask({ workspace: ".", objective: "Implemente um programa", acceptance: [], provider: "local", model: "fixture", baseUrl: null });
+      // Explicit tests-pass keeps this test about exit-zero evidence; the
+      // default for this objective is now "unverified" (acceptance-4).
+      const { taskId } = f.tasks.createTask({ workspace: ".", objective: "Implemente um programa", acceptance: ["tests-pass"], provider: "local", model: "fixture", baseUrl: null });
       const provider = new FakeProvider([{ toolCalls: [exec("require('fs').writeFileSync('program.js','console.log(1)')")], usage }, { text: "Done", usage }]);
       f.tasks.startTask(taskId, "start", provider); await until(() => f.tasks.snapshot(taskId).state !== "RUNNING");
       expect(fs.readFileSync(path.join(f.root, "program.js"), "utf8")).toBe("console.log(1)"); expect(f.tasks.snapshot(taskId)).toMatchObject({ state: "NEEDS_INPUT", acceptanceCriteria: ["tests-pass"] });

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createContract } from "../../src/runtime/contract.js";
 import {
   admitDurable,
+  markDispatching,
   claimDurable,
   findUnreconciledAttempts,
   reconcileEditAttempt,
@@ -212,6 +213,8 @@ describe("crash boundaries D-E: uncertain effect reconciled against the sink", (
     if (!admitted.admitted) throw new Error("admission failed");
     armFault("after-claim");
     expect(() => claimDurable(first.raw, admitted.attemptId, 1, 1)).toThrow();
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     clearFaults();
     // The invocation may have happened: apply the real effect through the tool.
     const out = await applyEdit(workspace, versionOf(BEFORE));
@@ -252,6 +255,8 @@ describe("crash boundaries D-E: uncertain effect reconciled against the sink", (
     const admitted = admitDurable(first.raw, makeContract("task-e", workspace), editIntent("task-e", "k", versionOf(BEFORE)), { calls: 50, tokens: 200000 }, 1);
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     const out = await applyEdit(workspace, versionOf(BEFORE));
     expect(out.status).toBe("completed");
     armFault("before-receipt-commit");
@@ -296,6 +301,8 @@ describe("crash boundaries D-E: uncertain effect reconciled against the sink", (
     const admitted = admitDurable(first.raw, makeContract("task-d2", workspace), editIntent("task-d2", "k", versionOf(BEFORE)), { calls: 50, tokens: 200000 }, 1);
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     first.close();
     openHandles.splice(openHandles.indexOf(first), 1);
 
@@ -328,6 +335,8 @@ describe("crash boundaries F-G: receipt present", () => {  it("F: committed rece
     const admitted = admitDurable(first.raw, makeContract("task-f", workspace), editIntent("task-f", "k", versionOf(BEFORE)), { calls: 50, tokens: 200000 }, 1);
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     recordReceiptDurable(first.raw, {
       attemptId: admitted.attemptId,
       outcome: "confirmed",
@@ -460,6 +469,8 @@ describe("orphan processes are quarantined, never adopted", () => {
     );
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     // A supervised child starts under generation 1 and outlives the runtime.
     const supervisor = new ProcessSupervisor(workspace);
     supervisors.push(supervisor);

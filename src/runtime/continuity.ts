@@ -2,8 +2,9 @@ import type { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { invalidateAdmittedIntent, receiptEffectVersions, taskBudgetSnapshot } from "./effects.js";
+import { dispatchEvidence, invalidateAdmittedIntent, receiptEffectVersions, recordReceiptDurable, taskBudgetSnapshot } from "./effects.js";
 import { listActiveWaits, type WaitRecord } from "./wait.js";
+import { recordRuntimeNote } from "./conversation.js";
 import { isContractExpired, type TaskContract } from "./contract.js";
 
 // S3 continuity: manual resume over durable state. This module never creates
@@ -186,6 +187,10 @@ export interface UnknownSummary {
   target: string | null;
   reason: string;
   recordedAt: string;
+  // A human saw this uncertainty and chose to continue with it recorded.
+  // Acknowledgement never reclassifies the effect: it stays UNKNOWN, its
+  // reservation stays counted, and equivalent intents stay refused.
+  acknowledged: boolean;
 }
 
 export function unknownHistory(db: DatabaseSync, taskId: string): UnknownSummary[] {
@@ -206,6 +211,7 @@ export function unknownHistory(db: DatabaseSync, taskId: string): UnknownSummary
     state: string;
     receipt: string | null;
   }>;
+  const acknowledged = acknowledgedAttempts(db, taskId);
   return rows.map((row) => {
     let reason = "effect uncertain; reconcile before retry";
     if (row.receipt !== null) {
@@ -223,8 +229,178 @@ export function unknownHistory(db: DatabaseSync, taskId: string): UnknownSummary
       target: row.target,
       reason,
       recordedAt: row.created_at,
+      acknowledged: acknowledged.has(row.attempt_id),
     };
   });
+}
+
+function acknowledgedAttempts(db: DatabaseSync, taskId: string): Set<string> {
+  const rows = db
+    .prepare("SELECT payload FROM events WHERE task_id = ? AND kind = 'unknown.acknowledged' ORDER BY seq ASC")
+    .all(taskId) as Array<{ payload: string }>;
+  const ids = new Set<string>();
+  for (const row of rows) {
+    try {
+      const parsed = JSON.parse(row.payload) as { attemptId?: unknown };
+      if (typeof parsed.attemptId === "string") ids.add(parsed.attemptId);
+    } catch {
+      // Unreadable acknowledgement proves nothing; the effect stays unacknowledged.
+    }
+  }
+  return ids;
+}
+
+// Records that a human saw the listed UNKNOWN effects and decided to continue
+// with them pending. This is a decision record, not a reconciliation: the
+// ledger keeps the effect UNKNOWN, the reservation keeps counting, and the
+// admission duplicate guard keeps refusing an equivalent intent.
+export function acknowledgeUnknownEffects(
+  db: DatabaseSync,
+  taskId: string,
+  input: { actor: string; note?: string | undefined; attemptIds?: readonly string[] | undefined },
+  now: Date = new Date(),
+): string[] {
+  const pending = unknownHistory(db, taskId).filter((entry) => !entry.acknowledged
+    && (input.attemptIds === undefined || input.attemptIds.includes(entry.attemptId)));
+  if (pending.length === 0) return [];
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    for (const entry of pending) {
+      db.prepare("INSERT INTO events (kind, task_id, payload, recorded_at) VALUES (?, ?, ?, ?)").run(
+        "unknown.acknowledged",
+        taskId,
+        JSON.stringify({ attemptId: entry.attemptId, intentId: entry.intentId, operation: entry.operation, actor: input.actor, note: input.note ?? null }),
+        now.toISOString(),
+      );
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Original error below remains the actionable signal.
+    }
+    throw error;
+  }
+  return pending.map((entry) => entry.attemptId);
+}
+
+// Effects that keep automatic verification from certifying completion:
+// anything in flight, and every UNKNOWN effect except an acknowledged remote
+// model call (which has no workspace effect; its cost stays counted). An
+// acknowledged tool UNKNOWN still blocks: the workspace may hold its effect.
+export function completionBlockingEffects(db: DatabaseSync, taskId: string): number {
+  const inFlight = db
+    .prepare("SELECT COUNT(*) AS n FROM intents WHERE task_id = ? AND state IN ('ADMITTED','CLAIMED')")
+    .get(taskId) as { n: number };
+  const unknown = unknownHistory(db, taskId).filter((entry) => !(entry.operation === "model.invoke" && entry.acknowledged));
+  return inFlight.n + new Set(unknown.map((entry) => entry.intentId)).size;
+}
+
+// Human acceptance: records WHO decided and on WHAT basis, then closes the
+// task as COMPLETED with basis "accepted-by-human". It is a decision record,
+// never a verification: criteria stay as they were, UNKNOWN effects stay
+// UNKNOWN (listed in the record), and the contract is not revised.
+export function acceptTaskResult(db: DatabaseSync, taskId: string, input: { actor: string; note: string | null }, now: Date = new Date()): { accepted: boolean; reason: string } {
+  const contract = readContract(db, taskId);
+  if (contract === null) return { accepted: false, reason: "unknown task" };
+  const state = readTaskState(db, taskId).state;
+  if (state === "COMPLETED") return { accepted: false, reason: "task already completed" };
+  if (state === "READY") {
+    const responses = db.prepare("SELECT COUNT(*) AS n FROM intents WHERE task_id = ? AND operation = 'model.invoke'").get(taskId) as { n: number };
+    if (responses.n === 0) return { accepted: false, reason: "nothing to accept yet" };
+  }
+  const unknowns = unknownHistory(db, taskId).map((entry) => entry.attemptId);
+  const verifications = readVerifications(db, taskId);
+  const edits = db.prepare("SELECT COUNT(*) AS n FROM intents WHERE task_id = ? AND operation = 'edit' AND state IN ('RESOLVED','RECONCILED')").get(taskId) as { n: number };
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    recordTaskEvent(db, taskId, "task.accepted", {
+      actor: input.actor,
+      note: input.note,
+      criteria: [...contract.acceptanceCriteria],
+      priorState: state,
+      unknowns,
+      verifications: verifications.length,
+      passingVerifications: verifications.filter((entry) => entry.exitCode === 0).length,
+      confirmedEdits: edits.n,
+      acceptedAt: now.toISOString(),
+    });
+    recordTaskEvent(db, taskId, "task-state", {
+      state: "COMPLETED",
+      reason: `accepted by human${unknowns.length > 0 ? ` with ${unknowns.length} UNKNOWN effect(s) still recorded` : ""}; not an automatic verification`,
+      basis: "accepted-by-human",
+    });
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Original error below remains the actionable signal.
+    }
+    throw error;
+  }
+  return { accepted: true, reason: "accepted" };
+}
+
+export interface RecoveredTask {
+  taskId: string;
+  priorState: string;
+  priorGeneration: number | null;
+  invalidatedAdmissions: string[];
+  unknowns: string[];
+}
+
+// Orphan recovery at owner start. A task whose latest state says RUNNING (or
+// WAITING on a supervised process) under a generation that is not the live
+// one has no executor: that owner is gone, so the claim "it is running" is
+// false and observably so. The TASK leaves RUNNING for INTERRUPTED; EFFECTS
+// are only classified (CLAIMED without receipt → UNKNOWN, never-claimed
+// admissions → INVALIDATED). Nothing is replayed, released or declared zero.
+export function recoverOrphanedTasks(db: DatabaseSync, generation: number, now: Date = new Date()): RecoveredTask[] {
+  const rows = db
+    .prepare(
+      `SELECT e.task_id, e.payload FROM events e
+       WHERE e.kind = 'task-state' AND e.task_id IS NOT NULL
+         AND e.seq = (SELECT MAX(seq) FROM events WHERE task_id = e.task_id AND kind = 'task-state')`,
+    )
+    .all() as Array<{ task_id: string; payload: string }>;
+  const recovered: RecoveredTask[] = [];
+  for (const row of rows) {
+    let state = "";
+    let owner: number | null = null;
+    try {
+      const parsed = JSON.parse(row.payload) as { state?: unknown; generation?: unknown };
+      state = typeof parsed.state === "string" ? parsed.state : "";
+      owner = typeof parsed.generation === "number" ? parsed.generation : null;
+    } catch {
+      continue;
+    }
+    if (owner === generation) continue;
+    const processWaits = state === "WAITING" ? listActiveWaits(db, row.task_id).filter((wait) => wait.kind === "process") : [];
+    if (state !== "RUNNING" && processWaits.length === 0) continue;
+    const invalidated = classifyUnfinishedIntents(db, row.task_id);
+    if (processWaits.length > 0) {
+      db.prepare("UPDATE waits SET state = 'cancelled', updated_at = ? WHERE task_id = ? AND kind = 'process' AND state = 'active'").run(now.toISOString(), row.task_id);
+    }
+    const unknowns = unknownHistory(db, row.task_id).filter((entry) => !entry.acknowledged).map((entry) => entry.attemptId);
+    const reason = `executor lost: the process running this task ended unexpectedly${owner === null ? "" : ` (owner generation ${owner})`}; effects classified, nothing replayed${unknowns.length > 0 ? `; ${unknowns.length} effect(s) UNKNOWN` : ""}`;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      recordTaskEvent(db, row.task_id, "task.interrupted", { priorState: state, priorGeneration: owner, recoveredBy: generation, invalidatedAdmissions: invalidated, unknowns });
+      recordTaskEvent(db, row.task_id, "task-state", { state: "INTERRUPTED", reason, generation });
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Original error below remains the actionable signal.
+      }
+      throw error;
+    }
+    recovered.push({ taskId: row.task_id, priorState: state, priorGeneration: owner, invalidatedAdmissions: invalidated, unknowns });
+  }
+  return recovered;
 }
 
 export interface DriftEntry {
@@ -400,7 +576,11 @@ export function evaluateResumeGate(db: DatabaseSync, input: ResumeGateInput, opt
   if (expired) {
     blockers.push({ code: "contract-expired", detail: `contract expired at ${contract.expiresAt}; a new grant is required before resuming` });
   }
-  if (state.state === "COMPLETED" || state.state === "CANCELLED") {
+  // COMPLETED closes the contract: continuing is a follow-up under a new
+  // contract, never a reopening. A human stop (CANCELLED) or a lost executor
+  // (INTERRUPTED) leaves unfinished work that may continue under the same
+  // grant, budget and session.
+  if (state.state === "COMPLETED") {
     blockers.push({ code: "terminal-state", detail: `task is ${state.state}; resume applies to unfinished work, not to closed tasks` });
   }
   const workspace = contract.scope[0] ?? "";
@@ -423,7 +603,12 @@ export function evaluateResumeGate(db: DatabaseSync, input: ResumeGateInput, opt
 
   const invalidatedAdmissions = options?.classifyPending === false ? [] : classifyUnfinishedIntents(db, input.taskId);
   const unknowns = unknownHistory(db, input.taskId);
-  if (unknowns.length > 0) blockers.push({ code: "unknown-effects", detail: "Unresolved effects must be reconciled before a new activation" });
+  // Restricted resume: UNKNOWN effects block only until a human has seen
+  // them. Acknowledged effects stay UNKNOWN in the ledger, keep their
+  // reservation counted, stay in the model context, and equivalent intents
+  // stay refused by admission until reconciled by observation.
+  const unacknowledged = unknowns.filter((entry) => !entry.acknowledged);
+  if (unacknowledged.length > 0) blockers.push({ code: "unknown-effects", detail: `${unacknowledged.length} unresolved effect(s) must be reconciled or acknowledged before a new activation` });
   const drift = workspaceOk && workspace !== "" ? detectWorkspaceDrift(db, input.taskId, workspace) : [];
   const staleEvidence = drift.map((entry) => ({
     path: entry.path,
@@ -476,6 +661,25 @@ function classifyUnfinishedIntents(db: DatabaseSync, taskId: string): string[] {
   for (const row of rows) {
     if (row.state === "ADMITTED") {
       if (invalidateAdmittedIntent(db, row.intent_id)) invalidated.push(row.intent_id);
+      continue;
+    }
+    // A claim whose dispatch marker never committed provably never started
+    // its effect: settle it as not executed (zero cost, reservation
+    // released) with the classification recorded as evidence.
+    const attempts = db.prepare("SELECT attempt_id FROM attempts WHERE intent_id = ? AND state = 'CLAIMED'").all(row.intent_id) as Array<{ attempt_id: string }>;
+    if (attempts.length > 0 && attempts.every((attempt) => dispatchEvidence(db, attempt.attempt_id) === "not-dispatched")) {
+      for (const attempt of attempts) {
+        recordReceiptDurable(db, {
+          attemptId: attempt.attempt_id,
+          outcome: "failed",
+          summary: `${row.operation} not dispatched: the executor stopped after the claim and before the dispatch marker; nothing was sent or executed`,
+          detailJson: JSON.stringify({ classification: "not-dispatched", usageFinal: true }),
+          settledCalls: 0,
+          settledTokens: 0,
+          releaseUnused: true,
+        });
+        recordTaskEvent(db, taskId, "unknown.not-dispatched", { intentId: row.intent_id, attemptId: attempt.attempt_id, operation: row.operation });
+      }
       continue;
     }
     quarantineClaimed(db, taskId, row.intent_id, row.operation);
@@ -539,21 +743,30 @@ function readVerifications(db: DatabaseSync, taskId: string): ResumeReport["veri
   return out;
 }
 
-function readHumanDecisions(db: DatabaseSync, taskId: string): string[] {
+// Decisions a human took about this task that the model must not lose when
+// older turns leave the window: restrictions, acknowledged uncertainty,
+// recorded reconciliations and acceptance. Messages themselves travel as
+// conversation turns. Bounded: the newest 10, each at most 300 characters.
+export function readHumanDecisions(db: DatabaseSync, taskId: string): string[] {
   const rows = db
-    .prepare("SELECT payload FROM events WHERE task_id = ? AND kind IN ('steering', 'steering-applied') ORDER BY seq ASC LIMIT 100")
-    .all(taskId) as Array<{ payload: string }>;
+    .prepare(
+      `SELECT kind, payload FROM events WHERE task_id = ?
+       AND kind IN ('steering', 'unknown.acknowledged', 'reconciliation.human', 'task.accepted') ORDER BY seq ASC`,
+    )
+    .all(taskId) as Array<{ kind: string; payload: string }>;
   const decisions: string[] = [];
   for (const row of rows) {
     try {
-      const parsed = JSON.parse(row.payload) as { text?: unknown; id?: unknown };
-      if (typeof parsed.text === "string") decisions.push(parsed.text);
-      else if (typeof parsed.id === "string") decisions.push(`steering ${parsed.id} applied`);
+      const parsed = JSON.parse(row.payload) as Record<string, unknown>;
+      if (row.kind === "steering" && parsed["mode"] === "forbid" && typeof parsed["text"] === "string") decisions.push(`restrição do usuário: ${parsed["text"]}`);
+      else if (row.kind === "unknown.acknowledged") decisions.push(`usuário reconheceu o efeito incerto ${String(parsed["operation"])} (${String(parsed["attemptId"])}) e decidiu continuar sem repeti-lo`);
+      else if (row.kind === "reconciliation.human") decisions.push(`usuário decidiu ${parsed["decision"] === "treat-as-applied" ? "que foi executado" : "que não foi executado"} o efeito ${String(parsed["attemptId"])}${typeof parsed["note"] === "string" ? `: ${parsed["note"]}` : ""}`);
+      else if (row.kind === "task.accepted") decisions.push(`usuário aceitou o resultado${typeof parsed["note"] === "string" ? `: ${parsed["note"]}` : ""}`);
     } catch {
       // Skip unreadable rows.
     }
   }
-  return decisions;
+  return decisions.slice(-10).map((text) => text.length > 300 ? `${text.slice(0, 300)}…` : text);
 }
 
 function blockedReport(taskId: string, blockers: ResumeBlocker[]): ResumeReport {
@@ -606,7 +819,18 @@ export function resumeTask(db: DatabaseSync, input: ResumeGateInput & { manifest
       manifest: { resumedFromState: report.state, resumedAt: new Date().toISOString(), ...(input.manifestExtra ?? {}) },
     },
   );
-  if (["RUNNING", "BLOCKED", "NEEDS_INPUT", "WAITING"].includes(report.state)) {
+  // The model learns, as a runtime observation, that this is a continuation
+  // and why the previous activation ended; uncertainty stays in the anchors.
+  const unknownCount = report.unknowns.length;
+  const why = report.state === "INTERRUPTED" ? "A execução anterior foi interrompida inesperadamente (o processo do Lattice terminou)."
+    : report.state === "CANCELLED" ? "O usuário havia interrompido a execução."
+      : report.state === "NEEDS_INPUT" ? "A execução anterior parou aguardando o usuário."
+        : report.state === "BLOCKED" ? `A execução anterior parou bloqueada: ${report.stateReason.slice(0, 300)}.`
+          : null;
+  if (why !== null) {
+    recordRuntimeNote(db, report.taskId, `${why} O usuário retomou a tarefa.${unknownCount > 0 ? ` ${unknownCount} efeito(s) seguem incertos e não serão repetidos automaticamente (ver Efeitos incertos).` : ""}`);
+  }
+  if (["RUNNING", "BLOCKED", "NEEDS_INPUT", "WAITING", "INTERRUPTED", "CANCELLED"].includes(report.state)) {
     recordTaskEvent(db, report.taskId, "task-state", {
       state: "READY",
       reason: "manual resume after restart; unfinished intents classified, no effect replayed",

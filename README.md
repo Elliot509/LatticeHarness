@@ -22,6 +22,17 @@ processes; the conversation is one view of that work.
 - Proportional verification: a directory/file observation, recognized passing tests,
   or an analysis response, according to the task contract.
 - Durable history and eligible continuation under the existing contract and budget.
+- A structured conversation with the provider: assistant tool calls and the results
+  that answer them travel as correlated turns, rebuilt from the ledger after a restart.
+- Work sessions: a message after completion starts a follow-up task that receives the
+  previous conversation as context, never its authority.
+- Crash recovery: a task whose process died is shown as **Interrompida por falha**
+  (`INTERRUPTED`), with confirmed and uncertain effects separated; nothing is repeated
+  without a human decision.
+- Human acceptance distinct from automatic verification, and an optional per-task
+  confirmation mode for edits and commands (see below).
+- A single executor with a visible queue, archiving, persisted drafts and last task,
+  and safe Markdown rendering of model answers (code blocks, tables, lists, links).
 - OpenAI-compatible provider configuration, model discovery/manual IDs, guidance and
   model switching. Active and pending selections are distinct.
 - A web UI and an Electron desktop shell with a native project chooser.
@@ -29,8 +40,9 @@ processes; the conversation is one view of that work.
 - Structured directory inventories with pagination and verified, persistent results.
 - Full final model responses, labeled separately from runtime-verified results.
 
-There is one execution engine. MCP, subagents, semantic memory, a universal planner
-and a general prompt-injection defense are not current capabilities. The retired
+There is one execution engine. MCP, subagents, semantic memory, a universal planner,
+token streaming and a general prompt-injection defense are not current capabilities;
+a phase indicator with elapsed time shows that a model call is in progress. The retired
 Agent Index/Plow integration is absent from the active product.
 
 ## Installation
@@ -121,9 +133,12 @@ bundle and isolated launch instructions are delivered separately to its owner.
    **Interromper** cancels work; it must not be interpreted as successful completion.
 
 The selected project also resolves local expressions such as `dentro deste
-ambiente`. After completion, **Enviar nova tarefa** creates a separate task in
-that project with the selected provider/model and configured limits. It does not
-send the previous conversation or inherit its acceptance criteria. Tool activity
+ambiente`. After completion, a message sent from the composer (**Enviar**) creates
+a follow-up task in that project. It has its own contract and criterion; it keeps
+the selected provider/model, configured limits and confirmation policy (never a
+broader one) and receives the previous conversation as context, not as authority.
+Requests without an automatic verifier (for example a change with no test or
+target criterion) end as **Aguardando sua revisão** instead of **Concluído**. Tool activity
 can be expanded to inspect arguments and captured results; successful execution
 groups are collapsed after verified completion.
 
@@ -149,6 +164,55 @@ criada e critério satisfeito, sem looping. Isso não certifica o modelo em gera
 Windows/Ubuntu continuam exigindo suas próprias validações do aplicativo nativo.
 Não há link de binário público nesta revisão.
 
+## Tasks, conversation and recovery
+
+| UI label | State | Meaning and what you can do |
+|---|---|---|
+| Em execução / Na fila | `RUNNING` / `READY` | Working, or waiting for the single executor. Messages become guidance; **Interromper** stops the run or leaves the queue. |
+| Precisa de resposta | `NEEDS_INPUT` | The agent asked something, or an action awaits confirmation. **Responder e continuar** records your message and continues. |
+| Aguardando sua revisão | `NEEDS_INPUT` | The run ended without an automatic verifier. **Aceitar resultado** records *your* acceptance (shown as **Aceito por você**); it is not a verification. |
+| Concluído | `COMPLETED` | The task criterion was verified by the runtime (filesystem, tests or answer). Continue with a follow-up message. |
+| Interrompido | `CANCELLED` | You stopped it. It can be resumed with a new message. |
+| Interrompida por falha | `INTERRUPTED` | The process that owned the run died (crash, kill, power loss). Confirmed effects stay recorded; uncertain ones are listed. |
+
+**Uncertain effects (`UNKNOWN`).** An action that may have run but has no receipt
+(for example a model call in flight when the app was killed) is never reclassified
+automatically. Depending on the effect type, the task view lets you observe the
+disk (edits), record that a command was or was not applied, or keep the effect
+uncertain and continue; a model call is never reconciled locally. Possible consumption of
+an uncertain model call stays counted against limits. CLI equivalents:
+`lattice reconcile <taskId> <attemptId> --action observe|acknowledge|treat-as-applied|treat-as-not-applied`,
+`lattice resume <taskId> --acknowledge-unknown` and `lattice accept <taskId>`.
+Automatic provider retry happens only when the request provably was not sent
+(connection refused, DNS); a 429/5xx or an abort in flight is uncertain.
+
+**Conversation.** The provider receives the original request, recent turns first,
+with each tool call and its result kept together; older evidence is omitted with
+a declared marker while the objective and current file versions stay anchored.
+The context budget is 24,000 characters of conversation text.
+
+### Human confirmation (opt-in)
+
+When creating a task you can tick **Pedir minha confirmação antes de alterar
+arquivos ou executar comandos**. Then every `edit`, `exec` and process-control
+action pauses the task and shows the exact action and arguments. The runtime
+enforces it before admission, also for direct protocol calls:
+
+- **Aprovar esta ação** authorizes that exact tool + arguments once, under the
+  current contract revision. An identical later call, a different argument, a
+  stale file version or a revised contract needs a new decision.
+- **Negar** returns a refusal to the model as that call's result; it cannot be
+  bypassed by re-asking. A message instead of a decision withdraws the request.
+- No answer means no execution: waiting, reloading, resuming or restarting the
+  app never approves anything. Accepting the result closes pending requests.
+- Decisions appear in the timeline (**Você aprovou / Você negou**). A decision is
+  not a result: the action's own receipt says what happened.
+
+The mode is **off by default** (the documented `local-trusted` behavior); the
+choice is remembered in the browser profile. Confirmation is consent, not
+containment: an approved command runs with your user privileges, and it is not an
+OS sandbox or a typed restriction.
+
 ## Architecture
 
 ```mermaid
@@ -169,9 +233,12 @@ flowchart TD
 The contract carries scope, grants, prohibitions, obligations and acceptance.
 A physical attempt has an identity and durable receipt; provider/model/endpoint
 are bound to the admitted request. SQLite stores sessions, runs, events, effects
-and usage. Context keeps the objective/authority and bounded recent observations;
-older evidence stays in durable records. This is bounded text context, not a
-promise about every provider's token window or native tool-conversation format.
+and usage. Model requests are a structured conversation (`assistant` turns with `tool_calls`
+and `tool` turns answering them by id) reconstructed from ledger events, so a
+resumed or restarted task continues the same conversation. The objective,
+authority and latest file versions are anchored; older turns are omitted in
+whole call/result groups with a declared marker. This is bounded context, not a
+promise about every provider's token window.
 
 The Electron main process owns window/project/lifecycle operations. A utility
 process runs the same backend/runtime as the web/CLI routes. The renderer uses
@@ -276,9 +343,11 @@ Known workflow limitations remain: guidance stored on a pre-inference
 `clarification-required` task does not resolve its criterion or restart it;
 create a new task with a clear objective or explicit criterion. Snapshots display
 the newest 500 chat messages, while older events remain in the ledger. LB-01
-(Composer reported disabled after `COMPLETED` in an educational campaign) is not
-considered closed: deterministic follow-up tests pass, but the reported campaign
-behavior still needs reconciliation. Real educational trials demonstrated
+(Composer reported disabled after `COMPLETED` in an educational campaign): the
+composer now continues completed tasks as follow-ups, covered by deterministic
+and real-Chromium tests; the original campaign has not been re-run with a hosted
+model. The web UI stays confined to the root it was started with; choosing another
+project is a desktop feature. Provider keys are not persisted (no keyring). Real educational trials demonstrated
 reading, explanations and persistence; complex Python correction and material
 organization failed in that campaign. These capabilities are not guaranteed.
 

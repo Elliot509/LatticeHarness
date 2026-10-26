@@ -27,9 +27,9 @@ describe("verified result and conversational follow-up in a real browser", () =>
       const { first, second } = await driveConversation(browser.session); expect(first.state).toBe("COMPLETED"); expect(second.state).toBe("COMPLETED"); expect(provider.requests).toHaveLength(3); expect(fs.statSync(path.join(workspace, "Python")).isDirectory()).toBe(true);
       await evaluate(browser.session, "(() => {const e=document.querySelector('.composer textarea');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(e,'Leia README.md e explique o conteúdo.');e.dispatchEvent(new Event('input',{bubbles:true}));})()");
       await evaluate(browser.session, "document.querySelector('.composer .primary').click()");
-      await waitFor(browser.session, "document.querySelector('.message-row.agent .text')?.textContent.includes('MODEL-FINAL-TAIL') === true && document.querySelector('.topbar')?.textContent.includes('Concluído') === true");
-      expect(await evaluate(browser.session, "document.querySelector('.message-row.agent .text').textContent")).toBe(finalText);
-      expect(await evaluate(browser.session, "document.querySelector('.message-row.agent .author').textContent")).toContain("resposta do modelo"); expect(provider.requests).toHaveLength(4);
+      await waitFor(browser.session, "document.querySelector('.chat > .message-row.agent .text')?.textContent.includes('MODEL-FINAL-TAIL') === true && document.querySelector('.topbar')?.textContent.includes('Concluído') === true");
+      expect(await evaluate(browser.session, "document.querySelector('.chat > .message-row.agent .text').textContent")).toBe(finalText);
+      expect(await evaluate(browser.session, "document.querySelector('.chat > .message-row.agent .author').textContent")).toContain("resposta do modelo"); expect(provider.requests).toHaveLength(4);
     } finally { await browser.close(); await server.close(); db.close(); await provider.close(); fs.rmSync(dir, { recursive: true, force: true }); }
   }, 30000);
 });

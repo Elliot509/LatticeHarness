@@ -1,14 +1,33 @@
 import type { DatabaseSync } from "node:sqlite";
 import { randomUUID, createHash } from "node:crypto";
 import {
-  compileSurface,
-  type EvidenceItem,
-  type ModelSurface,
+  compileConversation,
+  type ConversationSurface,
   type TaskSurface,
 } from "../context/compiler.js";
 import {
+  approvalKey,
+  approvalRequestedFor,
+  describeAction,
+  openDecision,
+  requestApproval,
+  requiresApproval,
+  useDecision,
+  withdrawApproval,
+} from "./approval.js";
+import {
+  normalizeToolCalls,
+  recordAssistantTurn,
+  recordRuntimeNote,
+  recordToolResult,
+  taskTurns,
+  unansweredCalls,
+  type ConversationTurn,
+} from "./conversation.js";
+import {
   admitDurable,
   claimDurable,
+  markDispatching,
   recordReceiptDurable,
   taskBudgetSnapshot,
 } from "./effects.js";
@@ -20,17 +39,20 @@ import {
   type WaitKind,
   type WaitRequest,
 } from "./wait.js";
-import { recordTaskEvent } from "./continuity.js";
+import { completionBlockingEffects, recordTaskEvent } from "./continuity.js";
 import type { AttemptStatus, AttemptUsage } from "../telemetry/usage.js";
 import type { TaskContract } from "./contract.js";
 import { isContractExpired } from "./contract.js";
 import { exceedsLimit } from "./budget.js";
 import { advanceCompositionEpoch, bindRequest, compositionForRoute, payloadDigest, type RequestBinding } from "./composition.js";
-import type {
-  ModelRequest,
-  ModelResponse,
-  ProviderAdapter,
-  ToolDefinition,
+import {
+  defaultDelivery,
+  type ModelRequest,
+  type ModelResponse,
+  type ModelToolCall,
+  type ProviderAdapter,
+  type ProviderDelivery,
+  type ToolDefinition,
 } from "../providers/types.js";
 import { normalizeUsageQuantities } from "../telemetry/usage.js";
 import { parseToolArgs, versionKey, type ToolContext, type ToolResult } from "../tools/types.js";
@@ -90,6 +112,12 @@ export interface LoopOptions {
   awaitWake?: (wait: NonNullable<LoopStop["wait"]>) => Promise<void>;
   onEvent?: (event: LoopEvent) => void;
   onModelText?: (text: string, source?: "model" | "verified") => void;
+  // Turns the request is built from. Defaults to this task's durable
+  // conversation; a follow-up task prepends the inherited exchange.
+  conversation?: (() => ConversationTurn[]) | undefined;
+  // Bounded automatic repetition for provider calls that provably never
+  // left this machine. Defaults: 2 repetitions, 500 ms doubling backoff.
+  unsentRetry?: { attempts: number; baseDelayMs: number } | undefined;
 }
 
 // Caller-provided wait policy. check() runs at the top of every iteration,
@@ -106,6 +134,7 @@ export type LoopEvent =
   | { kind: "tool-start"; attemptId: string; tool: string }
   | { kind: "tool-end"; attemptId: string; tool: string; status: string; handle?: string | undefined }
   | { kind: "wake"; text: string }
+  | { kind: "provider-retry"; attempt: number; reason: string }
   | { kind: "stop"; decision: LoopDecision; reason: string };
 
 function actionFingerprint(tool: string, argsJson: string): string {
@@ -134,7 +163,8 @@ const MAX_ANCHORED_VERSION_CHARS = 2_000;
 export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
   const maxIterations = options.maxIterations;
   const contextChars = options.contextChars ?? 24_000;
-  const evidence: EvidenceItem[] = [];
+  const taskId = options.contract.taskId;
+  const loadTurns = options.conversation ?? (() => taskTurns(options.db, taskId));
   const observations: string[] = [];
   const coverage = new Map<string, { version: string; items: Set<string> }>();
   let stagnant = 0;
@@ -142,6 +172,7 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
   let modelCalls = 0;
   let toolDispatches = 0;
   let editRevision = 0;
+  let unsentRetries = 0;
   // Latest edit-usable version per path, as tool results established it. It
   // is rendered into the always-included `Versões:` anchor, so the version a
   // read returned survives evidence omission until superseded or retired.
@@ -171,6 +202,176 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
     return stagnant >= 4;
   };
   const noProgress = (): LoopStop => stop("ASK", "no progress: repeated equivalent observations without observed progress; human guidance required", iterations, modelCalls, toolDispatches, options);
+
+  // Runs one assistant turn's tool calls in order. Returns a stop when the
+  // run must end (or pause for approval), null when every call was handled.
+  const runCalls = async (calls: readonly ModelToolCall[]): Promise<LoopStop | null> => {
+    const answer = (call: ModelToolCall, content: string, attemptId: string | null = null): void => {
+      recordToolResult(options.db, taskId, { runId: options.runId, toolCallId: call.id, name: call.name, attemptId, content });
+    };
+    // Calls after an early exit are answered explicitly: never executed.
+    const abandon = (from: number, reason: string): void => {
+      for (const call of calls.slice(from)) answer(call, `[${call.name}] não executada: ${reason}.`);
+    };
+    for (const [index, call] of calls.entries()) {
+      if (isAborted(options.signal)) {
+        abandon(index, "a execução foi interrompida pelo usuário");
+        return stop("STOP", "interrupted by user", iterations, modelCalls, toolDispatches, options);
+      }
+      const registered = options.tools.find((tool) => tool.name === call.name);
+      if (registered === undefined) {
+        answer(call, `Unknown tool requested: ${call.name}. Available: ${options.tools.map((tool) => tool.name).join(", ")}.`);
+        if (noteObservation(`unavailable:${call.name}`, "unknown tool")) { abandon(index + 1, "sem progresso observado"); return noProgress(); }
+        continue;
+      }
+      // Human confirmation (opt-in policy): enforced here, before admission.
+      // Without a decision the run pauses with this and later calls pending;
+      // a denial is this call's result; an approval is consumed once.
+      if (requiresApproval(options.contract, call.name, call.argumentsJson)) {
+        const key = approvalKey(call.name, call.argumentsJson);
+        let decision = openDecision(options.db, taskId, key);
+        // A decision binds the contract revision it was shown under; after a
+        // revision it is withdrawn and the same action is asked again.
+        if (decision !== null && decision.revision !== options.contract.revision) {
+          withdrawApproval(options.db, taskId, key, `contract revised (${String(decision.revision)} -> ${options.contract.revision}) since the request`);
+          decision = null;
+        }
+        if (decision === null) {
+          requestApproval(options.db, taskId, { key, tool: call.name, argsJson: call.argumentsJson, toolCallId: call.id, runId: options.runId, revision: options.contract.revision });
+          return stop("ASK", `approval required: ${describeAction(call.name, call.argumentsJson).slice(0, 300)}`, iterations, modelCalls, toolDispatches, options);
+        }
+        useDecision(options.db, taskId, key, null);
+        if (decision.decision === "denied") {
+          answer(call, `[${call.name}] negada pelo usuário: ${describeAction(call.name, call.argumentsJson)}${decision.note === null ? "" : ` (motivo: ${decision.note})`}. Não repita esta ação; siga outro caminho ou pergunte ao usuário.`);
+          if (noteObservation(`denied:${call.name}:${key}`, "denied by human")) { abandon(index + 1, "sem progresso observado"); return noProgress(); }
+          continue;
+        }
+      }
+      // Optional execution-activity cap (R1 D-R1-02): counts dispatches, not
+      // model calls. Unset = unbounded by this mechanism. The check runs
+      // BEFORE admission so a capped tool never reserves, claims, or
+      // dispatches; the denial is evidence, not a silent drop.
+      if (options.maxToolDispatches !== undefined && toolDispatches >= options.maxToolDispatches) {
+        answer(call, `Tool ${call.name} denied: tool dispatch limit reached (${toolDispatches}/${options.maxToolDispatches}); no dispatch, no claim.`);
+        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), "dispatch limit reached")) { abandon(index + 1, "sem progresso observado"); return noProgress(); }
+        continue;
+      }
+      const admission = admitDurable(
+        options.db,
+        options.contract,
+        {
+          taskId: options.contract.taskId,
+          operation: call.name,
+          target: callTarget(call.argumentsJson),
+          actionKey: `tool:${call.name}:${stableArgs(call.argumentsJson)}`,
+          authorityRevision: options.contract.revision,
+          maxCalls: 0,
+          maxTokens: 0,
+          argsJson: call.argumentsJson,
+          realm: options.toolContext.realm,
+          ...(call.name === "edit" ? { additionalTargets: renameTargets(call.argumentsJson) } : {}),
+        },
+        { calls: options.grantedCalls, tokens: options.grantedTokens },
+        options.ownerGeneration,
+        new Date(),
+        options.toolContext.workspaceRoot,
+      );
+      if (!admission.admitted) {
+        if (admission.reason === "budget-exceeded") {
+          abandon(index, "o orçamento configurado da tarefa acabou");
+          return stop("ESCALATE", admission.detail, iterations, modelCalls, toolDispatches, options);
+        }
+        answer(call, `Tool ${call.name} denied: ${admission.detail}`);
+        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), admission.detail)) { abandon(index + 1, "sem progresso observado"); return noProgress(); }
+        continue;
+      }
+      const toolClaim = claimDurable(options.db, admission.attemptId, options.ownerGeneration, options.contract.revision, {
+        contract: options.contract,
+        now: new Date(),
+      });
+      if (!toolClaim.claimed) {
+        recordReceiptDurable(options.db, {
+          attemptId: admission.attemptId,
+          outcome: "failed",
+          summary: `claim refused (${toolClaim.reason}); tool not invoked`,
+          detailJson: "{}",
+          settledCalls: 0,
+          settledTokens: 0,
+        });
+        answer(call, `Tool ${call.name} claim refused (${toolClaim.reason}).`, admission.attemptId);
+        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), toolClaim.reason)) { abandon(index + 1, "sem progresso observado"); return noProgress(); }
+        continue;
+      }
+      options.onEvent?.({ kind: "tool-start", attemptId: admission.attemptId, tool: call.name });
+      toolDispatches += 1;
+      markDispatching(options.db, admission.attemptId);
+      const summary = await invokeTool(registered, call.argumentsJson, { ...options.toolContext, ownerGeneration: options.ownerGeneration, attemptId: admission.attemptId, ...(options.signal !== undefined ? { signal: options.signal } : {}) });
+      recordReceiptDurable(options.db, {
+        attemptId: admission.attemptId,
+        outcome: summary.outcome,
+        summary: summary.text,
+        detailJson: summary.detailJson,
+        settledCalls: 0,
+        settledTokens: 0,
+      });
+      options.onEvent?.({
+        kind: "tool-end",
+        attemptId: admission.attemptId,
+        tool: call.name,
+        status: summary.outcome,
+        ...(summary.handleId !== undefined ? { handle: summary.handleId } : {}),
+      });
+      answer(call, summary.text, admission.attemptId);
+      if (summary.outcome === "unknown") {
+        abandon(index + 1, "um efeito anterior ficou incerto e a execução parou");
+        return stop("ESCALATE", "tool effect UNKNOWN; reconcile before further work", iterations, modelCalls, toolDispatches, options);
+      }
+      if (call.name === "edit" && summary.outcome === "confirmed") editRevision += 1;
+      if (summary.fileVersions !== undefined) noteFileVersions(summary.fileVersions);
+      const observation = JSON.parse(summary.detailJson) as { version?: unknown; observationKey?: unknown; progress?: { scope: string; version: string; items: string[] }; errorKind?: string };
+      let repeated: boolean;
+      if (observation.progress !== undefined) {
+        const progress = observation.progress;
+        const prior = coverage.get(progress.scope);
+        const current = prior?.version === progress.version ? prior : { version: progress.version, items: new Set<string>() };
+        const newItems = progress.items.some(item => !current.items.has(item));
+        if (prior?.version !== progress.version || newItems) stagnant = 0;
+        else stagnant += 1;
+        progress.items.forEach(item => current.items.add(item));
+        coverage.set(progress.scope, current);
+        repeated = stagnant >= 4;
+      } else repeated = noteObservation(observation.errorKind !== undefined ? `failed:${call.name}:${observation.errorKind}` : actionFingerprint(call.name, stableArgs(call.argumentsJson)), JSON.stringify([observation.observationKey ?? summary.text, observation.version ?? null]));
+      if (repeated) {
+        // A verified outcome wins over a repeat counter, but UNKNOWN above
+        // still exits before this check and unresolved effects still gate it.
+        if (options.verifyAfterTools === true) {
+          const verification = await checkCompletion(options);
+          if (verification.complete) { abandon(index + 1, "o critério da tarefa já foi verificado"); if (verification.finalText !== undefined) options.onModelText?.(verification.finalText, "verified"); return stop("STOP", verification.reason, iterations, modelCalls, toolDispatches, options); }
+        }
+        abandon(index + 1, "sem progresso observado");
+        return noProgress();
+      }
+    }
+    return null;
+  };
+
+
+  // Calls left unanswered by a pause for approval resume here, before any
+  // new model call: approved ones run, denied ones answer as denied. If the
+  // human replied with a message instead, the paused calls are withdrawn.
+  const pending = unansweredCalls(options.db, taskId);
+  const paused = pending.calls.filter((call) => approvalRequestedFor(options.db, taskId, call.id));
+  if (paused.length > 0) {
+    if (pending.afterUserMessage) {
+      for (const call of pending.calls) {
+        if (approvalRequestedFor(options.db, taskId, call.id)) withdrawApproval(options.db, taskId, approvalKey(call.name, call.argumentsJson));
+        recordToolResult(options.db, taskId, { runId: options.runId, toolCallId: call.id, name: call.name, attemptId: null, content: `[${call.name}] não executada: o usuário respondeu com uma mensagem em vez de aprovar esta ação.` });
+      }
+    } else if (!isAborted(options.signal)) {
+      const halted = await runCalls(pending.calls);
+      if (halted !== null) return halted;
+    }
+  }
 
   for (;;) {
     if (isAborted(options.signal)) {
@@ -204,7 +405,7 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
     if (waitCheck !== null) {
       if ("woke" in waitCheck) {
         const text = waitCheck.woke.text;
-        evidence.push({ id: `ev-${evidence.length + 1}`, text: `Wake observed: ${text.slice(0, 4000)}${text.length > 4000 ? "\n[observation truncated in model context; full durable wake retained]" : ""}` });
+        recordRuntimeNote(options.db, taskId, `Observação durável recebida (wake): ${text.slice(0, 4000)}${text.length > 4000 ? "\n[observação reduzida no contexto do modelo; wake completo preservado]" : ""}`);
         options.onEvent?.({ kind: "wake", text });
       } else {
         const waiting = enterWaiting(options, waitCheck.wait, iterations, modelCalls, toolDispatches);
@@ -217,15 +418,18 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
     options.beforeRequest?.();
     const pendingRevisions = takePendingRevisions(options.db, options.contract.taskId);
     for (const pending of pendingRevisions) {
-      evidence.push({
-        id: `ev-${evidence.length + 1}`,
-        text: `Revision ${pending.revision} arrived during activation and was revalidated at a safe point: ${describePending(pending.payload)}`,
-      });
+      // Human messages already reach the model as user turns; other
+      // revisions (route changes) become a runtime observation once.
+      if (pending.payload["kind"] === "steering") continue;
+      recordRuntimeNote(options.db, taskId, `Revisão ${pending.revision} aplicada em ponto seguro desta ativação: ${describePending(pending.payload)}`);
     }
 
-    let surface: ModelSurface;
+    let surface: ConversationSurface;
     try {
-      surface = compileSurface(options.taskSurface, evidence, { maxChars: contextChars });
+      const turns = loadTurns();
+      // The protocol needs a user turn; a task without a recorded request
+      // (older CLI runs) uses its contract objective, which is that request.
+      surface = compileConversation(options.taskSurface, turns.some((turn) => turn.kind === "user") ? turns : [{ kind: "user", seq: 0, text: options.contract.objective, taskId }, ...turns], { maxChars: contextChars });
     } catch (error) {
       return stop(
         "ESCALATE",
@@ -243,7 +447,7 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
     const providerId = options.modelRef?.providerId ?? provider.name;
     const model = activeModel(options);
     const request: ModelRequest = {
-      model, system: surface.system, messages: [{ role: "user", content: surface.task }],
+      model, system: surface.system, messages: surface.messages,
       tools: structuredClone(options.tools.map((tool) => tool.definition)),
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     };
@@ -262,7 +466,9 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
         taskId: options.contract.taskId,
         operation: "model.invoke",
         target: `${providerId}/${model}`,
-        actionKey: `model:${activeProvider(options).name}:${activeModel(options)}:${surface.surfaceVersion}:${iterations}`,
+        // Run-scoped: a new activation after an UNKNOWN model call is a new
+        // request over a different context, not a blind replay of the old one.
+        actionKey: `model:${activeProvider(options).name}:${activeModel(options)}:${surface.surfaceVersion}:${options.runId}:${iterations}`,
         authorityRevision: options.contract.revision,
         maxCalls: 1,
         maxTokens: estimateReservation(options, surface),
@@ -328,10 +534,12 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
     modelCalls += 1;
     try {
       if (payloadDigest(request) !== binding.payloadDigest) throw new Error("request changed after binding; dispatch refused");
+      markDispatching(options.db, modelAttempt.attemptId);
       response = await provider.complete(request);
     } catch (error) {
       const finishedAt = new Date();
-      const uncertain = isUncertainProviderError(error);
+      const delivery = providerDelivery(error);
+      const uncertain = delivery === "uncertain";
       const usageDocument = modelUsageDocument(options, {
         attemptId: modelAttempt.attemptId,
         intentId: modelAttempt.intentId,
@@ -345,16 +553,26 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
         dispatchedAt,
         finishedAt,
       });
+      // A request that provably never left this machine consumed nothing:
+      // it settles zero calls and releases its reservation. Everything else
+      // counts the call; an uncertain one also keeps its token reservation.
       recordReceiptDurable(options.db, {
         attemptId: modelAttempt.attemptId,
         outcome: uncertain ? "unknown" : "failed",
-        summary: `model invocation ${uncertain ? "uncertain" : "failed"}: ${errorMessage(error)}`,
-        detailJson: JSON.stringify({ kind: errorName(error), usageFinal: false }),
-        settledCalls: 1,
+        summary: `model invocation ${uncertain ? "uncertain" : delivery === "not-sent" ? "not sent" : "failed"}: ${errorMessage(error)}`,
+        detailJson: JSON.stringify({ kind: errorName(error), delivery, usageFinal: false }),
+        settledCalls: delivery === "not-sent" ? 0 : 1,
         settledTokens: 0,
-        releaseUnused: false,
+        releaseUnused: !uncertain,
         usageDocument,
       });
+      // Only provably unsent requests repeat automatically, bounded and
+      // abortable; each repetition is a new admitted attempt.
+      if (delivery === "not-sent" && !isAborted(options.signal) && unsentRetries < (options.unsentRetry?.attempts ?? 2)) {
+        unsentRetries += 1;
+        options.onEvent?.({ kind: "provider-retry", attempt: unsentRetries, reason: errorMessage(error) });
+        if (await abortableDelay((options.unsentRetry?.baseDelayMs ?? 500) * 2 ** (unsentRetries - 1), options.signal)) continue;
+      }
       return stop(
         "ESCALATE",
         `model invocation ${uncertain ? "UNKNOWN; reconcile before retry" : "failed"}: ${errorMessage(error)}`,
@@ -365,12 +583,17 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
       );
     }
     const finishedAt = new Date();
+    unsentRetries = 0;
     options.onEvent?.({ kind: "model-response", requestId, attemptId: modelAttempt.attemptId, toolCalls: response.toolCalls.length });
     const inventoryFinal = response.toolCalls.length === 0 && options.taskSurface.acceptanceCriteria.some(criterion => criterion.startsWith("directory-listing:"));
     if (response.text.trim() !== "" && !inventoryFinal) {
-      options.onModelText?.(response.toolCalls.length === 0 ? response.text : response.text.slice(0, 2000), "model");
+      options.onModelText?.(response.text, "model");
     }
     settleModelUsage(options, modelAttempt.attemptId, modelAttempt.intentId, requestId, response, admittedAt, dispatchedAt, finishedAt);
+    // The assistant turn is durable before any of its calls runs, so a crash
+    // mid-sequence leaves calls the next request answers as "no result".
+    const calls = normalizeToolCalls(options.db, taskId, modelAttempt.attemptId, response.toolCalls);
+    recordAssistantTurn(options.db, taskId, { runId: options.runId, attemptId: modelAttempt.attemptId, text: response.text, toolCalls: calls });
     const budget = snapshotBudget(options);
     if (exceedsLimit(budget.settled.calls, budget.granted.calls) || exceedsLimit(budget.settled.tokens, budget.granted.tokens)) {
       return stop("ESCALATE", "configured cumulative budget exceeded by observed provider usage; response accounted, no further effects authorized", iterations, modelCalls, toolDispatches, options);
@@ -394,121 +617,8 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
       );
     }
 
-    for (const call of response.toolCalls) {
-      if (isAborted(options.signal)) {
-        return stop("STOP", "interrupted by user", iterations, modelCalls, toolDispatches, options);
-      }
-      const registered = options.tools.find((tool) => tool.name === call.name);
-      if (registered === undefined) {
-        evidence.push({
-          id: `ev-${evidence.length + 1}`,
-          text: `Unknown tool requested: ${call.name}. Available: ${options.tools.map((tool) => tool.name).join(", ")}.`,
-        });
-        if (noteObservation(`unavailable:${call.name}`, "unknown tool")) return noProgress();
-        continue;
-      }
-      // Optional execution-activity cap (R1 D-R1-02): counts dispatches, not
-      // model calls. Unset = unbounded by this mechanism. The check runs
-      // BEFORE admission so a capped tool never reserves, claims, or
-      // dispatches; the denial is evidence, not a silent drop.
-      if (options.maxToolDispatches !== undefined && toolDispatches >= options.maxToolDispatches) {
-        evidence.push({
-          id: `ev-${evidence.length + 1}`,
-          text: `Tool ${call.name} denied: tool dispatch limit reached (${toolDispatches}/${options.maxToolDispatches}); no dispatch, no claim.`,
-        });
-        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), "dispatch limit reached")) return noProgress();
-        continue;
-      }
-      const admission = admitDurable(
-        options.db,
-        options.contract,
-        {
-          taskId: options.contract.taskId,
-          operation: call.name,
-          target: callTarget(call.argumentsJson),
-          actionKey: `tool:${call.name}:${stableArgs(call.argumentsJson)}`,
-          authorityRevision: options.contract.revision,
-          maxCalls: 0,
-          maxTokens: 0,
-          argsJson: call.argumentsJson,
-          realm: options.toolContext.realm,
-          ...(call.name === "edit" ? { additionalTargets: renameTargets(call.argumentsJson) } : {}),
-        },
-        { calls: options.grantedCalls, tokens: options.grantedTokens },
-        options.ownerGeneration,
-        new Date(),
-        options.toolContext.workspaceRoot,
-      );
-      if (!admission.admitted) {
-        if (admission.reason === "budget-exceeded") {
-          return stop("ESCALATE", admission.detail, iterations, modelCalls, toolDispatches, options);
-        }
-        evidence.push({ id: `ev-${evidence.length + 1}`, text: `Tool ${call.name} denied: ${admission.detail}` });
-        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), admission.detail)) return noProgress();
-        continue;
-      }
-      const toolClaim = claimDurable(options.db, admission.attemptId, options.ownerGeneration, options.contract.revision, {
-        contract: options.contract,
-        now: new Date(),
-      });
-      if (!toolClaim.claimed) {
-        recordReceiptDurable(options.db, {
-          attemptId: admission.attemptId,
-          outcome: "failed",
-          summary: `claim refused (${toolClaim.reason}); tool not invoked`,
-          detailJson: "{}",
-          settledCalls: 0,
-          settledTokens: 0,
-        });
-        evidence.push({ id: `ev-${evidence.length + 1}`, text: `Tool ${call.name} claim refused (${toolClaim.reason}).` });
-        if (noteObservation(actionFingerprint(call.name, stableArgs(call.argumentsJson)), toolClaim.reason)) return noProgress();
-        continue;
-      }
-      options.onEvent?.({ kind: "tool-start", attemptId: admission.attemptId, tool: call.name });
-      toolDispatches += 1;
-      const summary = await invokeTool(registered, call.argumentsJson, { ...options.toolContext, ownerGeneration: options.ownerGeneration, attemptId: admission.attemptId, ...(options.signal !== undefined ? { signal: options.signal } : {}) });
-      recordReceiptDurable(options.db, {
-        attemptId: admission.attemptId,
-        outcome: summary.outcome,
-        summary: summary.text,
-        detailJson: summary.detailJson,
-        settledCalls: 0,
-        settledTokens: 0,
-      });
-      options.onEvent?.({
-        kind: "tool-end",
-        attemptId: admission.attemptId,
-        tool: call.name,
-        status: summary.outcome,
-        ...(summary.handleId !== undefined ? { handle: summary.handleId } : {}),
-      });
-      evidence.push({ id: `ev-${evidence.length + 1}`, text: summary.text });
-      if (summary.outcome === "unknown") return stop("ESCALATE", "tool effect UNKNOWN; reconcile before further work", iterations, modelCalls, toolDispatches, options);
-      if (call.name === "edit" && summary.outcome === "confirmed") editRevision += 1;
-      if (summary.fileVersions !== undefined) noteFileVersions(summary.fileVersions);
-      const observation = JSON.parse(summary.detailJson) as { version?: unknown; observationKey?: unknown; progress?: { scope: string; version: string; items: string[] }; errorKind?: string };
-      let repeated: boolean;
-      if (observation.progress !== undefined) {
-        const progress = observation.progress;
-        const prior = coverage.get(progress.scope);
-        const current = prior?.version === progress.version ? prior : { version: progress.version, items: new Set<string>() };
-        const newItems = progress.items.some(item => !current.items.has(item));
-        if (prior?.version !== progress.version || newItems) stagnant = 0;
-        else stagnant += 1;
-        progress.items.forEach(item => current.items.add(item));
-        coverage.set(progress.scope, current);
-        repeated = stagnant >= 4;
-      } else repeated = noteObservation(observation.errorKind !== undefined ? `failed:${call.name}:${observation.errorKind}` : actionFingerprint(call.name, stableArgs(call.argumentsJson)), JSON.stringify([observation.observationKey ?? summary.text, observation.version ?? null]));
-      if (repeated) {
-        // A verified outcome wins over a repeat counter, but UNKNOWN above
-        // still exits before this check and unresolved effects still gate it.
-        if (options.verifyAfterTools === true) {
-          const verification = await checkCompletion(options);
-          if (verification.complete) { if (verification.finalText !== undefined) options.onModelText?.(verification.finalText, "verified"); return stop("STOP", verification.reason, iterations, modelCalls, toolDispatches, options); }
-        }
-        return noProgress();
-      }
-    }
+    const halted = await runCalls(calls);
+    if (halted !== null) return halted;
     if (options.verifyAfterTools === true) {
       const verification = await checkCompletion(options);
       if (verification.complete) { if (verification.finalText !== undefined) options.onModelText?.(verification.finalText, "verified"); return stop("STOP", verification.reason, iterations, modelCalls, toolDispatches, options); }
@@ -551,6 +661,7 @@ function enterWaiting(
   recordTaskEvent(options.db, options.contract.taskId, "task-state", {
     state: waitingState,
     reason: `waiting: ${request.condition} (wait ${waitId}); the app must stay alive for a wake to arrive`,
+    generation: options.ownerGeneration,
   });
   const reason = `waiting: ${request.condition}; zero model calls while stable`;
   options.onEvent?.({ kind: "stop", decision: "STOP", reason });
@@ -766,11 +877,11 @@ function settleModelUsage(
   });
 }
 
-function estimateReservation(options: LoopOptions, surface: ModelSurface): number {
+function estimateReservation(options: LoopOptions, surface: ConversationSurface): number {
   // This is a scheduling estimate, not a provider context or billing bound.
   // Reserve at most remaining configured authority; actual usage is always
   // recorded even when the provider exceeds this estimate.
-  const estimate = Buffer.byteLength(surface.system + surface.task + JSON.stringify(options.tools.map((tool) => tool.definition)), "utf8");
+  const estimate = Buffer.byteLength(surface.system + JSON.stringify(surface.messages) + JSON.stringify(options.tools.map((tool) => tool.definition)), "utf8");
   const budget = snapshotBudget(options);
   return budget.granted.tokens === null ? estimate : Math.max(0, Math.min(estimate, budget.granted.tokens - budget.settled.tokens - budget.reserved.tokens));
 }
@@ -810,9 +921,22 @@ function errorName(error: unknown): string {
   return error instanceof Error ? error.name : "unknown";
 }
 
-function isUncertainProviderError(error: unknown): boolean {
-  if (error === null || typeof error !== "object" || !("kind" in error)) return true;
-  return error.kind === "timeout" || error.kind === "network" || error.kind === "unknown";
+// Delivery classification for a failed provider call. Errors that do not
+// declare it are uncertain unless their kind proves rejection up front.
+function providerDelivery(error: unknown): ProviderDelivery {
+  if (error === null || typeof error !== "object") return "uncertain";
+  if ("delivery" in error && (error.delivery === "not-sent" || error.delivery === "uncertain" || error.delivery === "rejected")) return error.delivery;
+  if (!("kind" in error) || typeof error.kind !== "string") return "uncertain";
+  return defaultDelivery(error.kind as Parameters<typeof defaultDelivery>[0]);
+}
+
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal?.aborted === true) { resolve(false); return; }
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(true); }, ms);
+    const onAbort = (): void => { clearTimeout(timer); resolve(false); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export interface AcceptanceCheck {
@@ -822,8 +946,8 @@ export interface AcceptanceCheck {
 }
 
 async function checkCompletion(options: LoopOptions, response?: ModelResponse): Promise<AcceptanceCheck> {
-  const pending = options.db.prepare("SELECT COUNT(*) AS n FROM intents WHERE task_id = ? AND state IN ('ADMITTED','CLAIMED','UNKNOWN')").get(options.contract.taskId) as { n: number };
-  if (pending.n > 0) return { complete: false, reason: `${pending.n} unresolved effects require reconciliation` };
+  const pending = completionBlockingEffects(options.db, options.contract.taskId);
+  if (pending > 0) return { complete: false, reason: `${pending} unresolved effects require reconciliation` };
   return checkAcceptanceEvident(options.acceptanceVerifiers ?? [], response);
 }
 

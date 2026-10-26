@@ -17,7 +17,7 @@ import type { TaskSurface } from "../../src/context/compiler.js";
 // the request body the runtime actually serialized, so a version can only
 // reach the next tool call by crossing read → loop → surface → adapter.
 interface ChatBody {
-  messages: Array<{ role: string; content: string }>;
+  messages: Array<{ role: string; content: string | null }>;
   tools: Array<{ type: string; function: { name: string; description: string; parameters: Record<string, unknown> } }>;
 }
 type Reply = { text?: string; toolCalls?: Array<{ name: string; args: Record<string, unknown> }> };
@@ -49,10 +49,13 @@ async function reactiveModel(decide: (body: ChatBody, turn: number) => Reply) {
   };
 }
 
-const userText = (body: ChatBody): string => body.messages.find((message) => message.role === "user")?.content ?? "";
-const anchor = (body: ChatBody): string => /^Versões: .*$/m.exec(userText(body))?.[0] ?? "";
+// Surface-2: anchors travel in the system message; observations travel as
+// tool results. "userText" is everything the model reads in the request.
+const userText = (body: ChatBody): string => body.messages.map((message) => message.content ?? "").join("\n");
+const systemText = (body: ChatBody): string => body.messages.find((message) => message.role === "system")?.content ?? "";
+const anchor = (body: ChatBody): string => /^Versões: .*$/m.exec(systemText(body))?.[0] ?? "";
 // What a model would do: take the version the observation names, never derive it.
-const observedVersion = (body: ChatBody, file: string): string | undefined => new RegExp(`Versões: .*${file.replace(".", "\\.")}@(sha256:[0-9a-f]{16})`).exec(userText(body))?.[1];
+const observedVersion = (body: ChatBody, file: string): string | undefined => new RegExp(`Versões: .*${file.replace(".", "\\.")}@(sha256:[0-9a-f]{16})`).exec(systemText(body))?.[1];
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -173,7 +176,7 @@ describe("Versões anchor in the shared loop (CLI resume seeds it)", () => {
     const taskSurface: TaskSurface = { objective: "read files", acceptanceCriteria: ["response"], grants: ["read"], prohibitions: [], obligations: [], unknowns: [], humanDecisions: [], versions: ["note.txt@sha256:0000000000000000", "verify node --test: exit 0"], lastError: null };
     try {
       await runTaskLoop({ db: f.db.raw, provider, model: "fake-model-1", contract, sessionId: "s-f5", runId: "r-f5", taskSurface, tools: buildToolset(), toolContext: { workspaceRoot: f.root, realm: "local-trusted", timeoutMs: 5000 }, ownerGeneration: 1, grantedCalls: 50, grantedTokens: 200_000, maxIterations: 25 });
-      const anchors = provider.requests.map((request) => /^Versões: .*$/m.exec(request.messages[0]?.content ?? "")?.[0]);
+      const anchors = provider.requests.map((request) => /^Versões: .*$/m.exec(request.system)?.[0]);
       expect(anchors[0]).toBe("Versões: note.txt@sha256:0000000000000000 | verify node --test: exit 0");
       expect(anchors[1]).toBe(`Versões: verify node --test: exit 0 | note.txt@${contentVersion(Buffer.from("ola\n"))}`);
       const last = anchors[anchors.length - 1] ?? "";
@@ -199,7 +202,7 @@ describe("Versões anchor in the shared loop (CLI resume seeds it)", () => {
     try {
       await runTaskLoop({ db: f.db.raw, provider, model: "fake-model-1", contract, sessionId: "s-f5b", runId: "r-f5b", taskSurface, tools: buildToolset(), toolContext: { workspaceRoot: f.root, realm: "local-trusted", timeoutMs: 5000 }, ownerGeneration: 1, grantedCalls: 50, grantedTokens: 200_000, maxIterations: 15 });
       expect(provider.requests).toHaveLength(names.length + 1);
-      const last = /^Versões: (.*)$/m.exec(provider.requests[names.length]?.messages[0]?.content ?? "")?.[1] ?? "";
+      const last = /^Versões: (.*)$/m.exec(provider.requests[names.length]?.system ?? "")?.[1] ?? "";
       expect(last.length).toBeLessThanOrEqual(2_000);
       expect(last).toContain(`${names[9] ?? ""}@`);
       expect(last).not.toContain(`${names[0] ?? ""}@`);

@@ -7,7 +7,10 @@ export type TaskState =
   | "NEEDS_INPUT"
   | "BLOCKED"
   | "COMPLETED"
-  | "CANCELLED";
+  | "CANCELLED"
+  // The process that owned this task's execution ended unexpectedly. A fact
+  // about the local executor, never about remote or filesystem effects.
+  | "INTERRUPTED";
 
 export type ToolActivityStatus =
   | "running"
@@ -74,6 +77,9 @@ export interface BudgetView {
   settledCalls: number;
   settledTokens: number;
   uncertainUsageAttempts?: number;
+  // Subset of reserved held by UNKNOWN effects: possibly consumed, never zero.
+  possibleCalls?: number;
+  possibleTokens?: number;
 }
 
 export interface UnknownView {
@@ -82,6 +88,69 @@ export interface UnknownView {
   target: string | null;
   reason: string;
   recordedAt: string;
+  acknowledged?: boolean;
+  // What the server can do with it: observe the disk (edit), close it as
+  // inert (read/search), record a human decision (exec/process/edit), or
+  // only acknowledge it (model.invoke: possible remote consumption).
+  reconcile?: "observe" | "decide" | "acknowledge-only";
+}
+
+// How a task ended, kept apart from its state: an automatic verification,
+// a human acceptance and an unverifiable result are different facts and are
+// never collapsed into "completed". Uncertain effects are reported alongside.
+export type OutcomeKind = "verified" | "accepted" | "unverified" | "blocked";
+
+export interface TaskOutcome {
+  kind: OutcomeKind | null;
+  detail: string;
+  uncertainEffects: number;
+  acceptedAt?: string;
+  note?: string | null;
+}
+
+// An action waiting for the human's confirmation: exactly this tool with
+// exactly these arguments. Approving it authorizes one execution only.
+export interface ApprovalView {
+  key: string;
+  tool: string;
+  description: string;
+  argsJson: string;
+  // Full length of the recorded arguments; larger than argsJson.length when
+  // the view was cut.
+  argsChars?: number;
+  requestedAt: string;
+}
+
+// A recorded human answer to an approval request (or its withdrawal). It
+// authorizes or blocks one attempt; it is never evidence that anything ran.
+export interface ApprovalDecisionView {
+  id: string;
+  key: string;
+  seq: number;
+  tool: string;
+  description: string;
+  decision: "approved" | "denied" | "withdrawn";
+  note: string | null;
+  recordedAt: string;
+}
+
+// Server-computed affordances. The UI renders these instead of recomputing
+// authority rules; every command is still revalidated when it arrives.
+export interface Capability {
+  allowed: boolean;
+  reason?: string;
+}
+
+export type SendMode = "steer" | "continue" | "follow-up" | "none";
+
+export interface TaskCapabilities {
+  send: Capability & { mode: SendMode };
+  stop: Capability;
+  resume: Capability & { requiresAcknowledgement?: boolean };
+  accept: Capability;
+  reconcile: Capability;
+  followUp: Capability;
+  archive: Capability;
 }
 
 export interface WaitView {
@@ -112,6 +181,7 @@ export interface TaskSnapshot {
   waits: WaitView[];
   resumable: boolean;
   resumeBlockers: string[];
+  capabilities?: TaskCapabilities;
   budget: BudgetView;
   contextUsage: ContextUsage;
   messages: MessageView[];
@@ -119,6 +189,16 @@ export interface TaskSnapshot {
   verifications: VerificationView[];
   steering: SteeringView[];
   cut: number;
+  outcome?: TaskOutcome;
+  // 1-based position when the task waits for the single executor.
+  queuePosition?: number | null;
+  archived?: boolean;
+  approvalPolicy?: "none" | "confirm-mutations";
+  approvals?: ApprovalView[];
+  approvalHistory?: ApprovalDecisionView[];
+  // Work session: the task this one continues (a follow-up has its own
+  // contract; this is conversation context, never inherited authority).
+  previous?: { taskId: string; objective: string; state: TaskState; messages: MessageView[] } | null;
 }
 
 export type UiEvent =
@@ -137,7 +217,13 @@ export type ContextUsage = ({ known: false; usedTokens?: number; contextWindow?:
   capacitySource?: "models-endpoint.context_length"; capacityKind?: "nominal";
 };
 
-export type CommandKind = "create-task" | "follow-up-task" | "start-task" | "steer" | "stop" | "select-model" | "set-key" | "resume-task" | "wake";
+// Single source of truth for accepted command kinds: the HTTP parser and the
+// type both derive from this list, so a new command cannot be typed but
+// silently refused on the wire.
+export const COMMAND_KINDS = ["create-task", "follow-up-task", "start-task", "steer", "stop", "select-model", "set-key", "resume-task", "wake",
+  "send-message", "reconcile", "accept-result", "archive-task", "decide-approval"] as const;
+
+export type CommandKind = typeof COMMAND_KINDS[number];
 
 export interface UiCommand {
   commandId: string;
@@ -148,8 +234,8 @@ export interface UiCommand {
 }
 
 export type CommandResult =
-  | { accepted: true; commandId: string; taskId: string; revision: number; state: TaskState }
-  | { accepted: false; commandId: string; reason: "duplicate" | "stale" | "invalid" | "denied"; revision: number; state: TaskState };
+  | { accepted: true; commandId: string; taskId: string; revision: number; state: TaskState; detail?: string }
+  | { accepted: false; commandId: string; reason: "duplicate" | "stale" | "invalid" | "denied"; revision: number; state: TaskState; detail?: string };
 
 export interface SessionSummary {
   sessionId: string;
@@ -159,4 +245,8 @@ export interface SessionSummary {
   objective: string;
   state: TaskState;
   updatedAt: string;
+  parentTaskId?: string | null;
+  outcome?: OutcomeKind | null;
+  queuePosition?: number | null;
+  archived?: boolean;
 }

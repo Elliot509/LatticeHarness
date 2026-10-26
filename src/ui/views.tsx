@@ -12,9 +12,11 @@ import type {
 } from "./api.js";
 import { createCommandId } from "./api.js";
 import { unifiedDiff } from "./diff.js";
-import { taskActivity, taskStateDescription, toolSummaryPreview } from "./presentation.js";
+import { CopyButton, Markdown } from "./markdown-view.js";
+import { criterionLabel, displayStateLabel, effectiveCapabilities, humanizeReason, phaseStartedAt, sendLabel, taskActivity, toolActionText, toolSummaryPreview } from "./presentation.js";
 import { stateLabel, toolStatusLabel, type UiAction, type UiState, type UiView } from "./state.js";
 import type {
+  ApprovalDecisionView,
   MessageView,
   SteeringView,
   TaskSnapshot,
@@ -37,6 +39,7 @@ interface SidebarProps {
 }
 
 interface ChatProps {
+  api: ApiClient;
   state: UiState;
   dispatch: Dispatch;
 }
@@ -66,6 +69,7 @@ interface SettingsProps {
 }
 
 const DEFAULT_MODEL_KEY = "lattice.defaultModel";
+const CONFIRM_KEY = "lattice.confirmMutations";
 const DEFAULT_BASE_URL_KEY = "lattice.defaultBaseUrl";
 const SEND_ON_ENTER_KEY = "lattice.sendOnEnter";
 const FALLBACK_BASE_URL = "http://127.0.0.1:8080/v1";
@@ -195,12 +199,16 @@ function shortTime(iso: string): string {
   return `${hours}:${minutes}`;
 }
 
+function calls(value: number): string {
+  return `${value} ${value === 1 ? "chamada" : "chamadas"}`;
+}
+
 function formatTokens(value: number): string {
   return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : `${value}`;
 }
 
-function stateClass(state: string): string {
-  return `state state-${state.toLowerCase().replace("_", "-")}`;
+function stateClass(state: string, outcome?: string | null): string {
+  return `state state-${state.toLowerCase().replace("_", "-")}${outcome === "accepted" || outcome === "unverified" ? ` outcome-${outcome}` : ""}`;
 }
 
 function connectionLabel(state: UiState): string {
@@ -289,21 +297,25 @@ export function Header({ api, state }: HeaderProps): JSX.Element {
             <span className="crumb" title={task.workspace}>{task.workspace.split("/").pop() ?? task.workspace}</span>
             <span className="crumb-separator" aria-hidden="true">/</span>
             <span className="taskname" title={task.objective}>{task.objective}</span>
-            <span className={stateClass(task.state)} role="status">{stateLabel(task.state)}</span>
+            <span className={stateClass(task.state, task.outcome?.kind)} role="status">{displayStateLabel(task)}</span>
           </>
         ) : (
           <span className="taskname idle">Abrindo tarefa</span>
         )}
       </div>
       <div className="topbar-side">
+        {task !== null && task.capabilities !== undefined && (task.archived === true || task.capabilities.archive.allowed) && (
+          <ArchiveButton api={api} task={task} />
+        )}
         {task !== null && (
           <details className="budgettag">
             <summary>Diagnóstico</summary>
             <div className="budget-detail">
               <strong>Consumo acumulado da tarefa</strong>
-              <span>Observado e liquidado: {task.budget.settledCalls} chamadas · {formatTokens(task.budget.settledTokens)} tokens</span>
-              <span>Reservado: {task.budget.reservedCalls} chamadas · {formatTokens(task.budget.reservedTokens)} tokens</span>
-              <span>Uso incompleto: {task.budget.uncertainUsageAttempts ?? 0} tentativas · reserva é estimativa, não teto do consumo incerto</span>
+              <span>Observado e liquidado: {calls(task.budget.settledCalls)} · {formatTokens(task.budget.settledTokens)} tokens</span>
+              <span>Reservado em andamento: {calls(task.budget.reservedCalls - (task.budget.possibleCalls ?? 0))} · {formatTokens(task.budget.reservedTokens - (task.budget.possibleTokens ?? 0))} tokens</span>
+              {((task.budget.possibleCalls ?? 0) > 0 || (task.budget.possibleTokens ?? 0) > 0) && <span>Possivelmente consumido (não confirmado): {calls(task.budget.possibleCalls ?? 0)} · até ~{formatTokens(task.budget.possibleTokens ?? 0)} tokens — continua contando no limite</span>}
+              <span>Chamadas com contagem de uso incompleta: {task.budget.uncertainUsageAttempts ?? 0} · a reserva é uma estimativa, não um teto do consumo incerto</span>
               <span>Limite de chamadas: {task.budget.grantedCalls ?? "sem limite configurado"}</span>
               <span>Limite de tokens: {task.budget.grantedTokens === null ? "sem limite configurado" : formatTokens(task.budget.grantedTokens)}</span>
               <span>O provedor pode cobrar pelo uso.</span>
@@ -364,6 +376,27 @@ export function Header({ api, state }: HeaderProps): JSX.Element {
   );
 }
 
+function ArchiveButton({ api, task }: { api: ApiClient; task: TaskSnapshot }): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const archived = task.archived === true;
+  return (
+    <button
+      type="button"
+      className="btn archive-btn"
+      disabled={busy}
+      title={archived ? "Voltar a mostrar esta tarefa na lista" : "Tirar esta tarefa da lista. O histórico continua guardado."}
+      onClick={() => {
+        setBusy(true);
+        void api.command({ commandId: createCommandId(), kind: "archive-task", taskId: task.taskId, payload: { archived: !archived } })
+          .then(() => { window.dispatchEvent(new CustomEvent("lattice:sessions-stale")); })
+          .finally(() => { setBusy(false); });
+      }}
+    >
+      {archived ? "Desarquivar" : "Arquivar"}
+    </button>
+  );
+}
+
 function UiIcon({ name }: { name: "task" | "settings" | "help" | "search" | "folder" | "terminal" }): JSX.Element {
   const paths = {
     task: "M4 4h16v12H8l-4 4V4Z M8 8h8 M8 12h5",
@@ -394,6 +427,8 @@ export function Sidebar({ state, dispatch }: SidebarProps): JSX.Element {
   function openTask(taskId: string): void {
     dispatch({ type: "open-task", taskId });
     dispatch({ type: "set-view", view: "task" });
+    // On narrow screens the rail overlays the task: get out of the way.
+    if (window.innerWidth < 760) dispatch({ type: "sidebar", open: false });
   }
 
   function newTask(): void {
@@ -417,7 +452,10 @@ export function Sidebar({ state, dispatch }: SidebarProps): JSX.Element {
         </button>
       </div>
       {!collapsed && state.task !== null && (
-        <p className="railws" title={state.task.workspace}>{state.task.workspace}</p>
+        <div className="railws-row">
+          <p className="railws" title={state.task.workspace}>{state.task.workspace}</p>
+          <CopyButton text={state.task.workspace} label="Copiar caminho" />
+        </div>
       )}
       {!collapsed && (
         <button type="button" className="btn newtaskbtn" onClick={newTask}>
@@ -453,12 +491,13 @@ export function Sidebar({ state, dispatch }: SidebarProps): JSX.Element {
                   onClick={() => { openTask(session.taskId); }}
                   aria-current={session.taskId === state.activeTaskId}
                 >
-                  <span className="session-objective">{session.objective === "" ? "(tarefa sem título)" : session.objective}</span>
+                  <span className="session-objective">{session.parentTaskId !== undefined && session.parentTaskId !== null && <span className="followup-mark" title="Continuação de uma tarefa anterior" aria-label="Continuação">↳ </span>}{session.objective === "" ? "(tarefa sem título)" : session.objective}</span>
                   <span className="session-meta">
                     <span className={`session-state session-state-${session.state.toLowerCase().replace("_", "-")}`} aria-hidden="true" />
-                    {stateLabel(session.state)}
+                    {displayStateLabel({ state: session.state, outcome: { kind: session.outcome ?? null }, queuePosition: session.queuePosition })}
                     <span aria-hidden="true">·</span>
                     <time dateTime={session.updatedAt}>{session.updatedAt.slice(0, 16).replace("T", " ")}</time>
+                    {session.archived === true && <span className="archived-tag">arquivada</span>}
                   </span>
                 </button>
               </li>
@@ -467,6 +506,9 @@ export function Sidebar({ state, dispatch }: SidebarProps): JSX.Element {
               <li className="empty">{state.sessions.length === 0 ? "Nenhuma sessão ainda" : "Nenhuma sessão corresponde à busca"}</li>
             )}
           </ul>
+          <button type="button" className="linklike archived-toggle" aria-pressed={state.showArchived === true} onClick={() => { dispatch({ type: "show-archived", show: state.showArchived !== true }); }}>
+            {state.showArchived === true ? "Ocultar arquivadas" : "Mostrar arquivadas"}
+          </button>
           <div className="sidebar-foot">
             <p className={`connfoot ${state.connection}`} role="status">
               <span className="dot" aria-hidden="true" />
@@ -513,7 +555,8 @@ export function Sidebar({ state, dispatch }: SidebarProps): JSX.Element {
 }
 
 function ToolRow({ tool, onOpen, open }: { tool: ToolActivityView; onOpen: () => void; open: boolean }): JSX.Element {
-  const summary = toolSummaryPreview(tool, 180);
+  const preview = toolSummaryPreview(tool, 180);
+  const summary = preview.text === "" || /^(?:Sem resultado|Resultado reconciliado|Não executada|Em andamento)/u.test(preview.text) ? preview : toolSummaryPreview({ ...tool, summary: toolActionText(tool) }, 180);
   return (
     <div className={tool.status === "failed" ? "toolrow failed" : open ? "toolrow selected" : "toolrow"}>
       <button
@@ -541,14 +584,21 @@ function ToolRow({ tool, onOpen, open }: { tool: ToolActivityView; onOpen: () =>
   );
 }
 
-function MessageRow({ message }: { message: MessageView }): JSX.Element {
-  const author = message.source === "verified" ? "Resultado verificado pelo Lattice" : message.author === "user" ? "Você" : message.author === "agent" ? message.source === "model" ? "Agente · resposta do modelo" : "Agente · mensagem registrada" : "Runtime";
+function MessageRow({ message, pending = false }: { message: MessageView; pending?: boolean }): JSX.Element {
+  const author = message.source === "verified" ? "Lattice · resultado verificado" : message.author === "user" ? "Você" : message.author === "agent" ? message.source === "model" ? "Agente · resposta do modelo" : "Agente · mensagem registrada" : "Lattice";
+  // Model output is Markdown; what people typed and runtime notes stay
+  // literal (line breaks preserved), exactly as written.
+  const rich = message.author === "agent";
+  const richRef = useRef<HTMLDivElement>(null);
   return (
-    <article className={`message-row ${message.author}${message.source === "verified" ? " verified" : ""}`}>
-      <time className="eventtime" dateTime={message.recordedAt}>{shortTime(message.recordedAt)}</time>
+    <article className={`message-row ${message.author}${message.source === "verified" ? " verified" : ""}${pending ? " pending" : ""}`} aria-busy={pending || undefined}>
+      <time className="eventtime" dateTime={message.recordedAt}>{pending ? "…" : shortTime(message.recordedAt)}</time>
       <div className="message-content">
-        <span className="author">{author}</span>
-        <p className="text">{message.text}</p>
+        <div className="message-head">
+          <span className="author">{author}{pending ? " · enviando" : ""}</span>
+          {rich && <CopyButton text={message.text} label="Copiar resposta" className="btn copy-btn message-copy" selectOnFailure={() => richRef.current} />}
+        </div>
+        {rich ? <div className="text rich" ref={richRef}><Markdown text={message.text} /></div> : <p className="text plain">{message.text}</p>}
       </div>
     </article>
   );
@@ -600,17 +650,189 @@ function SteeringRow({ steering }: { steering: SteeringView }): JSX.Element {
   );
 }
 
-function TaskNotices({ task }: { task: TaskSnapshot }): JSX.Element | null {
-  const description = taskStateDescription(task);
-  const blockers = task.state === "COMPLETED" || task.state === "CANCELLED" || task.state === "RUNNING" ? [] : task.resumeBlockers.filter(blocker => blocker !== "terminal-state");
-  if (task.state === "COMPLETED" && task.messages.some(message => message.source === "verified") && task.unknowns === 0 && task.unknownHistory.length === 0 && task.waits.length === 0 && task.tools.every(tool => tool.status === "completed") && task.verifications.every(verification => verification.exitCode === 0)) return null;
-  if (description === "" && task.waits.length === 0 && task.unknowns === 0 && task.resumeBlockers.length === 0) return null;
+// The human's answer to a confirmation request, in the timeline. It is
+// labeled as a decision: what actually happened is the action's own row.
+function ApprovalDecisionRow({ decision }: { decision: ApprovalDecisionView }): JSX.Element {
+  const label = decision.decision === "approved" ? "Você aprovou" : decision.decision === "denied" ? "Você negou" : "Pedido de confirmação retirado";
+  const detail = decision.decision === "approved" ? "Autoriza uma única tentativa; o resultado aparece na ação correspondente."
+    : decision.decision === "denied" ? "A ação não foi executada; o agente foi informado."
+      : decision.note === "superseded by a user message" ? "Você respondeu com uma mensagem; a ação não foi executada." : "As condições mudaram desde o pedido; a ação será pedida de novo se necessário.";
+  return (
+    <div className={`steering-row approval-decision approval-${decision.decision}`}>
+      <time className="eventtime" dateTime={decision.recordedAt}>{shortTime(decision.recordedAt)}</time>
+      <span className="statusmark statusmark-steering" aria-hidden="true" />
+      <div className="steering-main">
+        <span>{label} · {decision.tool}</span>
+        <p>{decision.description}</p>
+        <p className="meta">{detail}{decision.decision !== "withdrawn" && decision.note !== null ? ` Observação: ${decision.note}` : ""}</p>
+      </div>
+    </div>
+  );
+}
+
+function ApprovalCard({ api, task, approval, dispatch }: { api: ApiClient; task: TaskSnapshot; approval: NonNullable<TaskSnapshot["approvals"]>[number]; dispatch: Dispatch }): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const [result, setResult] = useState("");
+  async function decide(decision: "approved" | "denied"): Promise<void> {
+    setBusy(true);
+    setResult("");
+    try {
+      const outcome = await api.command({ commandId: createCommandId(), kind: "decide-approval", taskId: task.taskId, payload: { key: approval.key, decision, note: note.trim() === "" ? null : note.trim() } });
+      setResult(outcome.detail ?? (outcome.accepted ? "Decisão registrada." : "Não foi possível registrar a decisão."));
+      dispatch({ type: "request-resync" });
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Falha ao registrar a decisão.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  let args = approval.argsJson;
+  try { args = JSON.stringify(JSON.parse(approval.argsJson), null, 2); } catch { /* show as recorded */ }
+  const cut = approval.argsChars !== undefined && approval.argsChars > approval.argsJson.length;
+  return (
+    <div className="notice-row approval-row" role="group" aria-label="Confirmação pendente">
+      <span>Confirmação</span>
+      <div className="uncertain-body">
+        <p><strong>O agente quer {approval.description}</strong><span>Aprovar autoriza somente esta ação, com exatamente estes argumentos, uma vez.</span></p>
+        <details className="tech-details" open><summary>Argumentos exatos</summary><pre className="output">{args}</pre></details>
+        {cut && <p className="meta" role="alert">Os argumentos são grandes demais para exibir por inteiro (mostrados {approval.argsJson.length} de {approval.argsChars} caracteres). Aprove só se confiar no trecho visível; na dúvida, negue e peça uma ação menor.</p>}
+        <label className="approval-note">Observação para o agente (opcional)<input value={note} maxLength={500} onChange={(event) => { setNote(event.target.value); }} placeholder="Ex.: não mexa no arquivo de configuração" /></label>
+        <div className="uncertain-actions">
+          <button type="button" className="btn primary" disabled={busy} onClick={() => { void decide("approved"); }}>Aprovar esta ação</button>
+          <button type="button" className="btn" disabled={busy} onClick={() => { void decide("denied"); }}>Negar</button>
+        </div>
+        {result !== "" && <p className="meta" role="status">{result}</p>}
+      </div>
+    </div>
+  );
+}
+
+function UnknownEffectRow({ api, task, unknown, dispatch }: { api: ApiClient; task: TaskSnapshot; unknown: TaskSnapshot["unknownHistory"][number]; dispatch: Dispatch }): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState("");
+  const canAct = effectiveCapabilities(task).reconcile.allowed && unknown.reconcile !== undefined;
+  async function act(action: "observe" | "acknowledge" | "treat-as-applied" | "treat-as-not-applied"): Promise<void> {
+    setBusy(true);
+    setResult("");
+    try {
+      const outcome = await api.command({ commandId: createCommandId(), kind: "reconcile", taskId: task.taskId, payload: { attemptId: unknown.attemptId, action } });
+      setResult(outcome.detail ?? (outcome.accepted ? "Registrado." : "Não foi possível reconciliar."));
+      dispatch({ type: "request-resync" });
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Falha ao reconciliar.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="notice-row uncertain-row">
+      <span>{unknown.acknowledged === true ? "Incerto · reconhecido" : "Efeito incerto"}</span>
+      <div className="uncertain-body">
+        <p>
+          <strong>{unknownOperationLabel(unknown.operation)}{unknown.target !== null ? ` · ${unknown.target}` : ""}</strong>
+          <span>{unknownExplanation(unknown.operation)}</span>
+        </p>
+        <details className="tech-details"><summary>Detalhes técnicos</summary><code>{unknown.attemptId}</code><p>{unknown.reason}</p></details>
+        {canAct && (
+          <div className="uncertain-actions">
+            {unknown.reconcile === "observe" && <button type="button" className="btn" disabled={busy} onClick={() => { void act("observe"); }}>Verificar no projeto</button>}
+            {unknown.reconcile !== "acknowledge-only" && unknown.operation !== "read" && unknown.operation !== "search" && <>
+              <button type="button" className="btn" disabled={busy} onClick={() => { void act("treat-as-applied"); }}>Confirmo que foi feito</button>
+              <button type="button" className="btn" disabled={busy} onClick={() => { void act("treat-as-not-applied"); }}>Confirmo que não foi feito</button>
+            </>}
+            {unknown.acknowledged !== true && <button type="button" className="btn" disabled={busy} onClick={() => { void act("acknowledge"); }}>Manter incerto e seguir</button>}
+          </div>
+        )}
+        {result !== "" && <p className="meta" role="status">{result}</p>}
+      </div>
+    </div>
+  );
+}
+
+function unknownOperationLabel(operation: string): string {
+  switch (operation) {
+    case "model.invoke": return "Chamada ao modelo sem resposta registrada";
+    case "edit": return "Edição de arquivo sem confirmação";
+    case "exec": return "Comando sem resultado observado";
+    case "process": return "Processo sem resultado observado";
+    case "read": return "Leitura sem resultado registrado";
+    case "search": return "Busca sem resultado registrado";
+    default: return operation;
+  }
+}
+
+function unknownExplanation(operation: string): string {
+  switch (operation) {
+    case "model.invoke": return "O provedor pode ter processado e cobrado esta chamada. O consumo possível continua contado no orçamento; o Lattice não a repete sozinho.";
+    case "edit": return "O arquivo pode ou não ter sido alterado. O Lattice pode comparar o disco com o plano da edição.";
+    case "exec":
+    case "process": return "O comando pode ter produzido efeitos. Só você pode confirmar o que aconteceu; o Lattice não o repete sozinho.";
+    default: return "Operação sem efeito no projeto; pode ser encerrada com segurança.";
+  }
+}
+
+function AcceptPanel({ api, task, dispatch, primary }: { api: ApiClient; task: TaskSnapshot; dispatch: Dispatch; primary: boolean }): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState("");
+  async function accept(): Promise<void> {
+    setBusy(true);
+    setResult("");
+    try {
+      const outcome = await api.command({ commandId: createCommandId(), kind: "accept-result", taskId: task.taskId, payload: { note: note.trim() === "" ? null : note.trim() } });
+      setResult(outcome.detail ?? (outcome.accepted ? "Resultado aceito." : "Não foi possível aceitar."));
+      if (outcome.accepted) setOpen(false);
+      dispatch({ type: "request-resync" });
+      dispatch({ type: "sessions-stale" });
+    } catch (error) {
+      setResult(error instanceof Error ? error.message : "Falha ao aceitar.");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="accept-panel">
+      {!open ? (
+        <button type="button" className={primary ? "btn primary" : "btn"} onClick={() => { setOpen(true); }}>
+          {primary ? "Aceitar resultado" : "Aceitar como está"}
+        </button>
+      ) : (
+        <div className="accept-confirm" role="group" aria-label="Confirmar aceitação">
+          <p className="meta">Aceitar registra que <strong>você</strong> considera o resultado bom. Não é uma verificação automática{task.unknownHistory.length > 0 ? ", e os efeitos incertos continuam registrados" : ""}. A tarefa será encerrada; para continuar depois, envie uma nova mensagem.</p>
+          <label>Observação (opcional)<input value={note} maxLength={500} onChange={(event) => { setNote(event.target.value); }} placeholder="Ex.: revisei o diff e está correto" /></label>
+          <div className="uncertain-actions">
+            <button type="button" className="btn primary" disabled={busy} onClick={() => { void accept(); }}>Confirmar aceitação</button>
+            <button type="button" className="btn" disabled={busy} onClick={() => { setOpen(false); }}>Cancelar</button>
+          </div>
+        </div>
+      )}
+      {result !== "" && <p className="meta" role="status">{result}</p>}
+    </div>
+  );
+}
+
+function TaskNotices({ api, task, dispatch }: { api: ApiClient; task: TaskSnapshot; dispatch: Dispatch }): JSX.Element | null {
+  const human = humanizeReason(task.state, task.stateReason);
+  const description = task.state === "RUNNING" ? "" : human.text;
+  const capabilities = effectiveCapabilities(task);
+  const blockers = task.state === "COMPLETED" || task.state === "RUNNING" || task.capabilities !== undefined ? [] : task.resumeBlockers.filter(blocker => blocker !== "terminal-state");
+  const possible = (task.budget.possibleCalls ?? 0) > 0 || (task.budget.possibleTokens ?? 0) > 0;
+  if (task.state === "COMPLETED" && task.outcome?.kind !== "accepted" && task.messages.some(message => message.source === "verified") && task.unknowns === 0 && task.unknownHistory.length === 0 && task.waits.length === 0 && task.tools.every(tool => tool.status === "completed") && task.verifications.every(verification => verification.exitCode === 0)) return null;
+  if (description === "" && task.waits.length === 0 && task.unknownHistory.length === 0 && blockers.length === 0 && (task.approvals ?? []).length === 0) return null;
   return (
     <section className={`task-notices task-notices-${task.state.toLowerCase().replace("_", "-")}`} aria-label="Estado da execução">
       {description !== "" && (
         <div className="task-notice-primary">
-          <span className={stateClass(task.state)}>{stateLabel(task.state)}</span>
-          <p>{description}</p>
+          <span className={stateClass(task.state, task.outcome?.kind)}>{displayStateLabel(task)}</span>
+          <div className="notice-body">
+            <p>{description}</p>
+            {human.technical !== null && human.technical !== description && <details className="tech-details"><summary>Detalhes técnicos</summary><p>{human.technical}</p></details>}
+            {effectiveCapabilities(task).accept.allowed && task.capabilities !== undefined && ["NEEDS_INPUT", "BLOCKED", "INTERRUPTED", "CANCELLED"].includes(task.state) && (
+              <AcceptPanel api={api} task={task} dispatch={dispatch} primary={task.outcome?.kind === "unverified"} />
+            )}
+          </div>
         </div>
       )}
       {task.waits.map((wait) => (
@@ -618,30 +840,67 @@ function TaskNotices({ task }: { task: TaskSnapshot }): JSX.Element | null {
           <span>Aguardando</span>
           <p>
             <strong>{wait.condition}</strong>
-            <span>{wait.obligation} · Mantenha o Lattice Agent em execução para wake automático.</span>
+            <span>{wait.obligation} · Mantenha o Lattice aberto para a continuação automática.</span>
           </p>
           <code>{wait.kind}</code>
         </div>
       ))}
-      {task.unknowns > 0 && (
+      {(task.approvals ?? []).map((approval) => <ApprovalCard key={approval.key} api={api} task={task} approval={approval} dispatch={dispatch} />)}
+      {task.unknownHistory.length > 0 && (
         <div className="notice-row uncertain-row">
-          <span>Efeitos incertos</span>
-          <p>{task.unknowns} {task.unknowns === 1 ? "efeito exige" : "efeitos exigem"} reconciliação antes de repetir.</p>
+          <span>Incertezas</span>
+          <p>
+            <strong>{task.unknownHistory.length} {task.unknownHistory.length === 1 ? "efeito não pôde ser confirmado" : "efeitos não puderam ser confirmados"}</strong>
+            <span>{possible ? `Consumo possível não confirmado: ${(task.budget.possibleCalls ?? 0) > 0 ? `${task.budget.possibleCalls ?? 0} chamada(s) e ` : ""}até ~${formatTokens(task.budget.possibleTokens ?? 0)} tokens (estimativa da reserva), que continuam contando no limite. ` : ""}Nada é repetido sem sua decisão.</span>
+          </p>
         </div>
       )}
-      {task.unknownHistory.map((unknown) => (
-        <div key={unknown.attemptId} className="notice-row uncertain-row">
-          <span>Efeito incerto</span>
-          <p>{unknown.operation}{unknown.target !== null ? ` ${unknown.target}` : ""}: {unknown.reason}</p>
-          <code>{unknown.attemptId}</code>
+      {task.unknownHistory.map((unknown) => <UnknownEffectRow key={unknown.attemptId} api={api} task={task} unknown={unknown} dispatch={dispatch} />)}
+      {!capabilities.resume.allowed && capabilities.resume.reason !== undefined && task.capabilities !== undefined && !["RUNNING", "COMPLETED", "READY"].includes(task.state) && (
+        <div className="notice-row">
+          <span>Para continuar</span>
+          <p>{capabilities.resume.reason}</p>
         </div>
-      ))}
+      )}
       {blockers.map((blocker, index) => (
         <div key={`${index}-${blocker}`} className="notice-row">
           <span>Bloqueio de retomada</span>
           <p>{blocker}</p>
         </div>
       ))}
+    </section>
+  );
+}
+
+function Elapsed({ since }: { since: number | null }): JSX.Element | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (since === null) return;
+    const timer = window.setInterval(() => { setNow(Date.now()); }, 1000);
+    return () => { window.clearInterval(timer); };
+  }, [since]);
+  if (since === null) return null;
+  const seconds = Math.max(0, Math.round((now - since) / 1000));
+  return <span className="elapsed" aria-hidden="true">{seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`}</span>;
+}
+
+function PreviousConversation({ previous, dispatch }: { previous: NonNullable<TaskSnapshot["previous"]>; dispatch: Dispatch }): JSX.Element {
+  return (
+    <section className="previous-conversation" aria-label="Conversa anterior desta sessão">
+      <div className="previous-head">
+        <span className="previous-label">Continuação de</span>
+        <button type="button" className="linklike" onClick={() => { dispatch({ type: "open-task", taskId: previous.taskId }); }} title="Abrir a tarefa anterior">
+          {previous.objective}
+        </button>
+        <span className={stateClass(previous.state)}>{stateLabel(previous.state)}</span>
+      </div>
+      <p className="meta">O agente recebe esta conversa como contexto. Permissões e critério de conclusão vêm apenas desta nova tarefa.</p>
+      {previous.messages.length > 0 && (
+        <details className="previous-messages">
+          <summary>Mostrar conversa anterior ({previous.messages.length} {previous.messages.length === 1 ? "mensagem" : "mensagens"})</summary>
+          {previous.messages.map((message) => <MessageRow key={`previous-${message.id}`} message={message} />)}
+        </details>
+      )}
     </section>
   );
 }
@@ -659,12 +918,12 @@ function ExecutionGroup({ task, items, inspecting, children }: { task: TaskSnaps
   }, [safe, inspecting]);
   const count = items.filter(item => item.kind === "tool").length;
   return <details className="execution-block" open={open} onToggle={event => { setOpen(event.currentTarget.open); }}>
-    <summary>{count > 0 ? `${count} ${count === 1 ? "ferramenta" : "ferramentas"}${task.state === "COMPLETED" ? " executadas" : ""}` : "Verificações"} · {stateLabel(task.state)}{!safe && task.state === "COMPLETED" ? " · há ocorrências para inspecionar" : ""}</summary>
+    <summary>{count > 0 ? `${count} ${count === 1 ? "ferramenta" : "ferramentas"}${task.state === "COMPLETED" ? count === 1 ? " executada" : " executadas" : ""}` : "Verificações"} · {displayStateLabel(task)}{!safe && task.state === "COMPLETED" ? " · há ocorrências para inspecionar" : ""}</summary>
     {children}
   </details>;
 }
 
-export function Chat({ state, dispatch }: ChatProps): JSX.Element {
+export function Chat({ api, state, dispatch }: ChatProps): JSX.Element {
   const chatRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const [following, setFollowing] = useState(true);
@@ -682,9 +941,15 @@ export function Chat({ state, dispatch }: ChatProps): JSX.Element {
   const renderActivity = (item: typeof activity[number]): JSX.Element => {
     switch (item.kind) {
       case "message": return <MessageRow key={`message-${item.value.id}`} message={item.value} />;
-      case "tool": return <ToolRow key={`tool-${item.value.id}`} tool={item.value} open={state.detailId === item.value.id} onOpen={() => { dispatch({ type: "select-detail", detailId: state.detailId === item.value.id ? null : item.value.id }); }} />;
+      case "tool": return (
+        <div key={`tool-${item.value.id}`}>
+          <ToolRow tool={item.value} open={state.detailId === item.value.id} onOpen={() => { dispatch({ type: "select-detail", detailId: state.detailId === item.value.id ? null : item.value.id }); }} />
+          {item.value.tool === "edit" && item.value.status === "completed" && task !== null && <InlineDiff api={api} taskId={task.taskId} tool={item.value} />}
+        </div>
+      );
       case "verification": return <VerificationRow key={`verification-${item.value.id}`} verification={item.value} />;
       case "steering": return <SteeringRow key={`steering-${item.value.id}`} steering={item.value} />;
+      case "approval": return <ApprovalDecisionRow key={item.value.id} decision={item.value} />;
     }
   };
   useLayoutEffect(() => {
@@ -721,12 +986,15 @@ export function Chat({ state, dispatch }: ChatProps): JSX.Element {
           if (chatPositions.size > 64) chatPositions.delete(chatPositions.keys().next().value ?? "");
         }}
       >
+        {task.previous !== undefined && task.previous !== null && <PreviousConversation previous={task.previous} dispatch={dispatch} />}
+        <h1 className="sr-only-heading">{task.objective}</h1>
         <details className="objective-panel" open>
           <summary>Objetivo</summary>
           <p>{task.objective}</p>
-          <span className="meta">Critérios: {task.acceptanceCriteria.join(" · ")}</span>
+          <span className="meta" title={task.acceptanceCriteria.join(" · ")}>Concluída quando houver: {task.acceptanceCriteria.map(criterionLabel).join(" · ")}</span>
+          {task.approvalPolicy === "confirm-mutations" && <span className="meta approval-policy">Alterar arquivos e executar comandos pede sua confirmação.</span>}
         </details>
-        <TaskNotices task={task} />
+        <TaskNotices api={api} task={task} dispatch={dispatch} />
         <div className="timeline-head">
           <h2>Execução</h2>
           <span>{activity.length} {activity.length === 1 ? "evento" : "eventos"}</span>
@@ -734,7 +1002,8 @@ export function Chat({ state, dispatch }: ChatProps): JSX.Element {
         {task.state === "RUNNING" && (
           <div className="running-row" role="status">
             <span className="pulse" aria-hidden="true" />
-            <span>{task.stateReason.trim() !== "" ? task.stateReason : "Em execução — acompanhando eventos do runtime."}</span>
+            <span>{humanizeReason(task.state, task.stateReason).text || "O agente está trabalhando."}</span>
+            <Elapsed since={phaseStartedAt(task.stateReason)} />
           </div>
         )}
         {activity.length === 0 && task.state !== "RUNNING" && (
@@ -748,6 +1017,9 @@ export function Chat({ state, dispatch }: ChatProps): JSX.Element {
             {group.map(renderActivity)}
           </ExecutionGroup>
         ) : group.map(renderActivity))}
+        {state.pending.filter((command) => command.kind === "steer").map((command) => (
+          <MessageRow key={`pending-${command.commandId}`} pending message={{ id: `pending-${command.commandId}`, seq: 0, author: "user", text: command.text, recordedAt: new Date(command.sentAt).toISOString() }} />
+        ))}
         <div ref={bottomRef} />
       </div>
       {!following && (
@@ -775,7 +1047,9 @@ export function Detail({ api, state, dispatch }: DetailProps): JSX.Element | nul
   const [argumentsTruncated, setArgumentsTruncated] = useState(false);
   const [detailState, setDetailState] = useState<"loading" | "ready" | "unavailable">("loading");
   const [loadedDetailId, setLoadedDetailId] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ path: string; line: number | null } | null>(null);
   useEffect(() => {
+    setPreview(null);
     setFull(null);
     setFullTruncated(false);
     setArgumentsText(null);
@@ -858,6 +1132,17 @@ export function Detail({ api, state, dispatch }: DetailProps): JSX.Element | nul
           {argumentsTruncated && <p className="meta">Argumentos truncados no limite de apresentação.</p>}
         </section>}
         {tool.tool === "edit" && selectedDetailState === "ready" && full !== null && <DiffView full={full} />}
+        {tool.tool === "search" && selectedDetailState === "ready" && full !== null && <SearchResults output={full} onOpen={(file, line) => { setPreview({ path: file, line }); }} />}
+        {(tool.tool === "read" || tool.tool === "edit") && tool.target !== null && !tool.target.startsWith("/") && (
+          <section className="inspector-section">
+            <h3>Arquivo</h3>
+            <div className="uncertain-actions">
+              <button type="button" className="btn" onClick={() => { setPreview({ path: tool.target ?? "", line: null }); }}>Ver conteúdo atual</button>
+              <CopyButton text={tool.target} label="Copiar caminho" />
+            </div>
+          </section>
+        )}
+        {preview !== null && <FilePreview api={api} taskId={task.taskId} path={preview.path} line={preview.line} onClose={() => { setPreview(null); }} />}
         <section className="inspector-section output-section">
           <h3>Evidência</h3>
           {selectedDetailState === "loading" ? (
@@ -887,51 +1172,51 @@ export function Composer({ api, state, dispatch }: ComposerProps): JSX.Element {
   const [sending, setSending] = useState(false);
   const [notice, setNotice] = useState("");
   const busy = useRef(false);
-  const followUp = useRef<{ from: string; text: string; commandId: string } | null>(null);
+  // A retry of the same text on the same task reuses the command identity, so
+  // a lost acknowledgement never creates a second message or follow-up.
+  const lastAttempt = useRef<{ taskId: string; text: string; commandId: string } | null>(null);
 
   async function send(): Promise<void> {
     const text = state.draft.trim();
-    if (task === null || task.state === "CANCELLED" || text === "" || busy.current || composing) return;
+    if (task === null || text === "" || busy.current || composing) return;
+    const capability = effectiveCapabilities(task).send;
+    if (!capability.allowed) { setNotice(capability.reason ?? "Mensagens indisponíveis agora."); return; }
     busy.current = true;
     setSending(true);
-    if (task.state === "COMPLETED") {
-      const request = followUp.current?.from === task.taskId && followUp.current.text === text ? followUp.current : { from: task.taskId, text, commandId: createCommandId() };
-      followUp.current = request;
-      try {
-        const result = await api.command({ commandId: request.commandId, kind: "follow-up-task", taskId: task.taskId, payload: { objective: text } });
-        if (!result.accepted) throw new Error("A nova solicitação foi recusada. Seu rascunho foi preservado.");
-        if (result.state === "READY") {
-          setNotice("A nova tarefa foi criada, mas o início não foi confirmado. Reenvie para confirmar a mesma solicitação; o rascunho foi preservado.");
-          dispatch({ type: "sessions", sessions: await api.sessions() });
-          return;
-        }
+    setNotice("");
+    const attempt = lastAttempt.current?.taskId === task.taskId && lastAttempt.current.text === text ? lastAttempt.current : { taskId: task.taskId, text, commandId: createCommandId() };
+    lastAttempt.current = attempt;
+    if (capability.mode !== "follow-up") {
+      dispatch({ type: "command-sent", command: { commandId: attempt.commandId, kind: "steer", text, sentAt: Date.now() } });
+      dispatch({ type: "draft", draft: "" });
+    }
+    try {
+      const result = task.capabilities === undefined && capability.mode === "follow-up"
+        ? await api.command({ commandId: attempt.commandId, kind: "follow-up-task", taskId: task.taskId, payload: { objective: text } })
+        : task.capabilities === undefined
+          ? await api.command({ commandId: attempt.commandId, kind: "steer", taskId: task.taskId, expectedRevision: task.contractRevision, payload: { text, mode: "guide" } })
+          : await api.command({ commandId: attempt.commandId, kind: "send-message", taskId: task.taskId, payload: { text } });
+      if (!result.accepted) {
+        lastAttempt.current = null;
+        dispatch({ type: "command-done", commandId: attempt.commandId });
+        dispatch({ type: "task-draft", taskId: task.taskId, draft: text });
+        setNotice(`${result.detail ?? "A mensagem não foi aceita."} Seu rascunho foi preservado.`);
+        dispatch({ type: "request-resync" });
+        return;
+      }
+      lastAttempt.current = null;
+      if (result.detail !== undefined) setNotice(result.detail);
+      if (result.taskId !== "" && result.taskId !== task.taskId) {
         dispatch({ type: "task-draft", taskId: task.taskId, draft: "" });
         dispatch({ type: "open-task", taskId: result.taskId });
-        followUp.current = null;
-        setNotice("");
-      } catch (error) {
-        setNotice(error instanceof Error ? error.message : "Envio não confirmado. Reenvie para confirmar a mesma solicitação; seu rascunho foi preservado.");
-      } finally { busy.current = false; setSending(false); }
-      return;
-    }
-    const commandId = createCommandId();
-    dispatch({ type: "command-sent", command: { commandId, kind: "steer", text, sentAt: Date.now() } });
-    dispatch({ type: "draft", draft: "" });
-    try {
-      const result = await api.command({
-        commandId,
-        kind: "steer",
-        taskId: task.taskId,
-        expectedRevision: task.contractRevision,
-        payload: { text, mode: "guide" },
-      });
-      if (!result.accepted) {
-        dispatch({ type: "task-draft", taskId: task.taskId, draft: text });
-        dispatch({ type: "command-failed", taskId: task.taskId, commandId, error: "A orientação foi recusada pelo runtime. Seu rascunho foi preservado." });
+        dispatch({ type: "sessions", sessions: await api.sessions() });
+      } else {
+        dispatch({ type: "request-resync" });
       }
-    } catch {
+    } catch (error) {
+      dispatch({ type: "command-done", commandId: attempt.commandId });
       dispatch({ type: "task-draft", taskId: task.taskId, draft: text });
-      dispatch({ type: "command-failed", taskId: task.taskId, commandId, error: "Não foi possível confirmar o envio. Confira o histórico antes de reenviar; seu rascunho foi preservado." });
+      setNotice(`Envio não confirmado (${error instanceof Error ? error.message : "falha de comunicação"}). Reenvie: a mesma mensagem não será duplicada. Seu rascunho foi preservado.`);
     } finally {
       busy.current = false;
       setSending(false);
@@ -939,57 +1224,63 @@ export function Composer({ api, state, dispatch }: ComposerProps): JSX.Element {
   }
 
   async function stop(): Promise<void> {
-    if (task === null || (task.state !== "RUNNING" && task.state !== "WAITING") || sending) return;
+    if (task === null || sending) return;
     setSending(true);
     try {
       const commandId = createCommandId();
       dispatch({ type: "command-sent", command: { commandId, kind: "stop", text: "stop requested", sentAt: Date.now() } });
       const result = await api.command({ commandId, kind: "stop", taskId: task.taskId });
-      if (!result.accepted) setNotice("Interrupção recusada pelo core; a tarefa não tem uma execução ativa neste runtime.");
+      if (!result.accepted) {
+        dispatch({ type: "command-failed", taskId: task.taskId, commandId, error: result.detail ?? "A interrupção não foi aceita." });
+        dispatch({ type: "request-resync" });
+      }
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "falha ao interromper");
+      setNotice(error instanceof Error ? error.message : "Falha ao interromper.");
     } finally {
       setSending(false);
     }
   }
 
-  async function resume(): Promise<void> {
-    if (task === null || task.state === "RUNNING" || sending) return;
+  async function resume(acknowledgeUnknown = false): Promise<void> {
+    if (task === null || sending) return;
     setSending(true);
+    setNotice("");
     try {
-      const resumed = await api.command({ commandId: createCommandId(), kind: "resume-task", taskId: task.taskId });
-      if (!resumed.accepted) {
-        setNotice("Retomada recusada pelo core; o estado ou a autoridade da tarefa não permite.");
-        return;
+      if (task.state !== "READY") {
+        const resumed = await api.command({ commandId: createCommandId(), kind: "resume-task", taskId: task.taskId, payload: { acknowledgeUnknown } });
+        if (!resumed.accepted) {
+          setNotice(resumed.detail ?? "A tarefa não pode continuar agora.");
+          dispatch({ type: "request-resync" });
+          return;
+        }
       }
       const started = await api.command({ commandId: createCommandId(), kind: "start-task", taskId: task.taskId });
-      setNotice(started.accepted ? "Retomada na mesma sessão e concessão" : "Retomada, mas a execução não foi aceita");
+      setNotice(started.accepted ? "" : started.detail ?? "A tarefa está pronta, mas a execução não começou. Tente continuar novamente.");
+      dispatch({ type: "request-resync" });
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "falha ao retomar");
+      setNotice(error instanceof Error ? error.message : "Falha ao continuar.");
     } finally {
       setSending(false);
     }
   }
 
   if (task === null) return <div className="composer" />;
-  const destination =
-    task.state === "COMPLETED" ? "Nova tarefa no mesmo projeto · contexto anterior não enviado" : task.state === "RUNNING"
-      ? "orientação para o turno atual"
-      : task.state === "NEEDS_INPUT"
-        ? "resposta para a pergunta pendente"
-        : "orientação registrada na tarefa";
+  const capabilities = effectiveCapabilities(task);
+  const labels = sendLabel(capabilities.send.mode, task.state);
+  const sendBlockedReason = capabilities.send.allowed ? null : capabilities.send.reason ?? "Mensagens indisponíveis agora.";
   return (
     <div className="composer">
       <div className="composer-inner">
         <div className="composer-meta">
-          <span className="composer-dest">{destination}</span>
+          <span className="composer-dest">{labels.destination}</span>
           <span className="hint">{sendHint()}</span>
         </div>
         <textarea
           value={state.draft}
           aria-label="Mensagem para a tarefa"
+          aria-describedby={sendBlockedReason !== null ? "composer-blocked" : undefined}
           rows={2}
-          placeholder={task.state === "COMPLETED" ? "Nova solicitação" : "Orientar tarefa"}
+          placeholder={labels.placeholder}
           disabled={sending}
           onChange={(event) => { dispatch({ type: "draft", draft: event.target.value }); }}
           onCompositionStart={() => { setComposing(true); }}
@@ -1002,28 +1293,32 @@ export function Composer({ api, state, dispatch }: ComposerProps): JSX.Element {
           }}
         />
         <div className="composer-actions">
-          <span className="composer-state">rev {task.contractRevision} · {stateLabel(task.state)}</span>
-          {(task.state === "RUNNING" || task.state === "WAITING") && (
+          <span className="composer-state">{displayStateLabel(task)}</span>
+          {capabilities.stop.allowed && (
             <button type="button" className="btn danger" disabled={sending} onClick={() => { void stop(); }}>
-              Interromper
+              {typeof task.queuePosition === "number" ? "Tirar da fila" : "Interromper"}
             </button>
           )}
-          {task.state !== "RUNNING" && task.resumable && (
-            <button type="button" className="btn" disabled={sending} onClick={() => { void resume(); }}>
-              Retomar
+          {capabilities.resume.allowed && task.state !== "RUNNING" && task.outcome?.kind !== "unverified" && (
+            <button type="button" className="btn" disabled={sending} title="Continua a tarefa sem enviar mensagem" onClick={() => { void resume(); }}>
+              {task.capabilities === undefined ? "Retomar" : "Continuar"}
             </button>
           )}
-          <button type="button" className="btn primary" disabled={sending || state.draft.trim() === "" || task.state === "CANCELLED"} onClick={() => { void send(); }}>
-            {sending ? "Enviando" : task.state === "COMPLETED" ? "Enviar nova tarefa" : "Enviar"}
+          {!capabilities.resume.allowed && capabilities.resume.requiresAcknowledgement === true && (
+            <button type="button" className="btn" disabled={sending} title="Registra que você viu os efeitos incertos e continua; eles permanecem incertos" onClick={() => { void resume(true); }}>
+              Reconhecer incerteza e continuar
+            </button>
+          )}
+          <button type="button" className="btn primary" disabled={sending || state.draft.trim() === "" || !capabilities.send.allowed} onClick={() => { void send(); }}>
+            {sending ? "Enviando…" : labels.button}
           </button>
         </div>
-        {notice !== "" && <p className="meta" role="status">{notice}</p>}
+        {sendBlockedReason !== null && <p id="composer-blocked" className="meta composer-blocked" role="status">{sendBlockedReason}</p>}
+        {notice !== "" && <p className="meta composer-notice" role="status">{notice}</p>}
         {state.pending
-          .filter((command) => command.kind === "steer" || command.kind === "stop")
+          .filter((command) => command.kind === "stop")
           .map((command) => (
-            <p key={command.commandId} className="meta" role="status">
-              {command.kind === "stop" ? "interrupção pedida; aguardando o core confirmar" : `enviado: ${command.text}`}
-            </p>
+            <p key={command.commandId} className="meta" role="status">Interrupção pedida; aguardando confirmação.</p>
           ))}
       </div>
     </div>
@@ -1334,6 +1629,12 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
   const [starting, setStarting] = useState(false);
   const [panel, setPanel] = useState<"model" | "workspace" | null>(null);
   const [composing, setComposing] = useState(false);
+  const [ready, setReady] = useState({ info: false, defaults: false });
+  const [confirmMutations, setConfirmMutations] = useState(() => { try { return window.localStorage.getItem(CONFIRM_KEY) === "1"; } catch { return false; } });
+  // Bound to the route it describes: a status for another provider or
+  // endpoint (still loading after a change) never blocks the current one.
+  const [keyStatus, setKeyStatus] = useState<{ route: string; required: boolean; configured: boolean; name: string } | null>(null);
+  const [preview, setPreview] = useState<string[] | null>(null);
   const modelButtonRef = useRef<HTMLButtonElement>(null);
   const workspaceButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -1344,17 +1645,46 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
       .then((info) => {
         if (!cancelled) setWorkspace(info.workspace);
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => { if (!cancelled) setReady((current) => ({ ...current, info: true })); });
     void loadUiDefaults(api).then((defaults) => {
       if (cancelled) return;
       setProviderId(defaults.providerId);
       if (defaults.model !== "") setModel(defaults.model);
       if (defaults.baseUrl !== null) setBaseUrl(defaults.baseUrl);
-    });
+    }).finally(() => { if (!cancelled) setReady((current) => ({ ...current, defaults: true })); });
     return () => {
       cancelled = true;
     };
   }, [api]);
+
+  // Credential presence for the selected route (never the key itself).
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([api.providers(), api.providerStatus(providerId, baseUrl.trim() || null)])
+      .then(([presets, status]) => {
+        if (cancelled) return;
+        const preset = presets.find((entry) => entry.id === providerId);
+        // A preset with an explicit endpoint may be a local or proxied server.
+        const required = preset?.keyRequired === true && baseUrl.trim() === "";
+        setKeyStatus({ route: `${providerId}|${baseUrl.trim()}`, required, configured: status.some((entry) => entry.id === providerId && entry.keyConfigured), name: preset?.displayName ?? providerId });
+      })
+      .catch(() => { if (!cancelled) setKeyStatus(null); });
+    return () => { cancelled = true; };
+  }, [api, providerId, baseUrl, panel]);
+
+  // What the runtime will require to call this request done, in words.
+  useEffect(() => {
+    const text = objective.trim();
+    if (text === "" || acceptanceCriterion.trim() !== "") { setPreview(acceptanceCriterion.trim() === "" ? null : [acceptanceCriterion.trim()]); return; }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      api.acceptancePreview(text).then((result) => { if (!cancelled) setPreview(result.criteria); }).catch(() => { if (!cancelled) setPreview(null); });
+    }, 350);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [api, objective, acceptanceCriterion]);
+
+  useEffect(() => { setError(""); }, [workspace, model, objective, providerId]);
 
   async function persistDefaults(pick: ModelPick): Promise<void> {
     setProviderId(pick.providerId);
@@ -1374,12 +1704,22 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
     catch (error) { setError(error instanceof Error ? error.message : "Não foi possível escolher o projeto."); }
   }
 
+  const loading = !ready.info || !ready.defaults;
+  const checklist = [
+    { id: "workspace", done: workspace.trim() !== "", label: workspace.trim() === "" ? "Escolha a pasta do projeto" : "Pasta do projeto escolhida", action: () => { void chooseProject(); }, actionLabel: "Escolher pasta" },
+    { id: "model", done: model.trim() !== "", label: model.trim() === "" ? "Escolha o provedor e o modelo" : `Modelo: ${model.trim()}`, action: () => { setPanel("model"); }, actionLabel: "Configurar modelo" },
+    ...(keyStatus?.required === true && keyStatus.route === `${providerId}|${baseUrl.trim()}` ? [{ id: "key", done: keyStatus.configured, label: keyStatus.configured ? `Chave de ${keyStatus.name} configurada nesta sessão` : `Informe a chave de API de ${keyStatus.name}`, action: () => { setPanel("model"); }, actionLabel: "Informar chave" }] : []),
+    { id: "objective", done: objective.trim() !== "", label: objective.trim() === "" ? "Descreva o que você quer fazer" : "Pedido descrito", action: () => { document.getElementById("new-task-objective")?.focus(); }, actionLabel: "Escrever pedido" },
+  ];
+  const blocking = checklist.filter((item) => !item.done && item.id !== "objective");
+  const firstUse = state.sessions.length === 0;
+
   async function start(): Promise<void> {
-    if (objective.trim() === "" || starting) return;
-    if (workspace.trim() === "") { setError("Escolha o projeto antes de iniciar a tarefa."); return; }
-    if (model.trim() === "") {
-      setError("Escolha o modelo antes de iniciar a tarefa.");
-      setPanel("model");
+    if (objective.trim() === "" || starting || loading) return;
+    const missing = blocking[0];
+    if (missing !== undefined) {
+      setError(`${missing.label}.`);
+      if (missing.id === "model" || missing.id === "key") setPanel("model");
       return;
     }
     const parseLimit = (value: string): number | null => value.trim() === "" ? null : Number(value);
@@ -1392,10 +1732,10 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
       const created = await api.command({
         commandId: createCommandId(),
         kind: "create-task",
-        payload: { workspace, objective: objective.trim(), acceptance: acceptanceCriterion.trim() === "" ? [] : [acceptanceCriterion.trim()], provider: providerId, model: model.trim(), baseUrl: baseUrl.trim() === "" ? null : baseUrl.trim(), budget: { calls, tokens } },
+        payload: { workspace, objective: objective.trim(), acceptance: acceptanceCriterion.trim() === "" ? [] : [acceptanceCriterion.trim()], provider: providerId, model: model.trim(), baseUrl: baseUrl.trim() === "" ? null : baseUrl.trim(), budget: { calls, tokens }, approval: confirmMutations ? "confirm-mutations" : "none" },
       });
       if (!created.accepted || created.taskId === "") {
-        setError("A tarefa não foi aceita pelo runtime.");
+        setError(created.accepted ? "A tarefa não foi aceita pelo runtime." : created.detail ?? "A tarefa não foi aceita pelo runtime.");
         return;
       }
       dispatch({ type: "draft", draft: "" });
@@ -1403,7 +1743,7 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
       dispatch({ type: "open-task", taskId: created.taskId });
       const started = await api.command({ commandId: createCommandId(), kind: "start-task", taskId: created.taskId });
       if (!started.accepted) {
-        dispatch({ type: "command-failed", commandId: started.commandId, taskId: created.taskId, error: "A tarefa foi criada, mas a execução não foi aceita. O histórico foi aberto; use Retomar quando o runtime estiver disponível." });
+        dispatch({ type: "command-failed", commandId: started.commandId, taskId: created.taskId, error: `A tarefa foi criada, mas ainda não começou: ${started.detail ?? "o runtime não aceitou o início"}. Use Continuar quando for possível.` });
         return;
       }
       await saveUiDefaults(api, { providerId, model: model.trim(), baseUrl: baseUrl.trim() === "" ? null : baseUrl.trim() }).catch(() => {
@@ -1428,9 +1768,33 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
       <p className="newtask-eyebrow">Lattice Agent · Harness local</p>
       <h1 id="newtask-title">O que vamos construir?</h1>
       <p className="newtask-subtitle">Seu projeto, uma tarefa clara e resultados observados.</p>
-      <details className="task-limits"><summary>Critério de conclusão opcional</summary>
-        <label>Critério explícito<input value={acceptanceCriterion} onChange={event => { setAcceptanceCriterion(event.target.value); }} placeholder="directory-exists:TesteMuse" /></label>
-        <p className="meta">Vazio usa um critério conservador. Opções: directory-exists:caminho, file-exists:caminho, tests-pass ou response. Use um alvo relativo ao projeto para pedidos ambíguos.</p>
+      {(firstUse || blocking.length > 0) && !loading && (
+        <section className="onboarding" aria-label="Antes de começar">
+          <h2>{firstUse ? "Primeiros passos" : "Antes de começar"}</h2>
+          <ol>
+            {checklist.map((item) => (
+              <li key={item.id} className={item.done ? "done" : "todo"}>
+                <span className="check" aria-hidden="true">{item.done ? "✓" : "○"}</span>
+                <span className="label">{item.label}</span>
+                {!item.done && <button type="button" className="btn" onClick={item.action}>{item.actionLabel}</button>}
+              </li>
+            ))}
+          </ol>
+          {firstUse && <p className="meta">O Lattice trabalha somente dentro da pasta escolhida e registra cada ação. Você acompanha, orienta ou interrompe a qualquer momento.</p>}
+        </section>
+      )}
+      <label className="confirm-toggle">
+        <input type="checkbox" checked={confirmMutations} onChange={(event) => {
+          setConfirmMutations(event.target.checked);
+          try { window.localStorage.setItem(CONFIRM_KEY, event.target.checked ? "1" : "0"); } catch { /* preference only */ }
+        }} />
+        <span>Pedir minha confirmação antes de alterar arquivos ou executar comandos</span>
+      </label>
+      {!confirmMutations && <p className="meta trust-note">Sem confirmação, o agente edita arquivos e executa comandos nesta pasta com as suas permissões de usuário (modo local-trusted). Não há sandbox do sistema operacional.</p>}
+      <details className="task-limits"><summary>Avançado: como o Lattice decide que terminou</summary>
+        <p className="meta">Por padrão o Lattice escolhe um critério a partir do pedido: perguntas e explicações terminam com a resposta; pedidos que citam testes exigem testes passando; criar uma pasta ou arquivo exige vê-los no projeto; outras mudanças terminam aguardando sua revisão.</p>
+        <label>Critério explícito (opcional)<input value={acceptanceCriterion} onChange={event => { setAcceptanceCriterion(event.target.value); }} placeholder="ex.: file-exists:docs/guia.md" /></label>
+        <p className="meta">Formatos aceitos: <code>file-exists:caminho</code>, <code>directory-exists:caminho</code>, <code>tests-pass</code>, <code>response</code> ou <code>unverified</code> (sua revisão).</p>
       </details>
       <details className="task-limits"><summary>Limites opcionais</summary>
         <label>Chamadas de modelo<input type="number" min="1" step="1" value={callLimit} onChange={event => { setCallLimit(event.target.value); }} placeholder="Sem limite configurado" /></label>
@@ -1565,13 +1929,14 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
           }}
         />
         <div className="newtask-composer-actions">
-          <span><UiIcon name="terminal" />Execução local</span>
+          <span className="newtask-preview" aria-live="polite">{preview !== null && preview.length > 0 ? <>Concluída quando houver: {preview.map(criterionLabel).join(" · ")}</> : <><UiIcon name="terminal" />Execução local</>}</span>
           <button
             type="submit"
             className="newtask-submit"
-            disabled={starting || objective.trim() === ""}
+            disabled={starting || loading || objective.trim() === "" || blocking.length > 0}
             aria-label={starting ? "Iniciando tarefa" : "Iniciar tarefa"}
-            title={starting ? "Iniciando tarefa" : "Iniciar tarefa"}
+            aria-describedby={blocking.length > 0 ? "newtask-blocking" : undefined}
+            title={starting ? "Iniciando tarefa" : blocking.length > 0 ? `Falta: ${blocking.map((item) => item.label.toLowerCase()).join("; ")}` : "Iniciar tarefa"}
           >
             {starting ? "···" : "↑"}
           </button>
@@ -1579,6 +1944,8 @@ export function NewTask({ api, state, dispatch }: NewTaskProps): JSX.Element {
       </form>
       <div className="newtask-footnote">
         <span>{sendOnEnterEnabled() ? "Enter para iniciar · Shift+Enter para nova linha" : "Ctrl+Enter para iniciar · Enter para nova linha"}</span>
+        {blocking.length > 0 && !loading && <span id="newtask-blocking" className="meta">Falta: {blocking.map((item) => item.label.toLowerCase()).join("; ")}.</span>}
+        {loading && <span className="meta" role="status">Carregando configuração…</span>}
         {error !== "" && <span className="error" role="alert">{error}</span>}
       </div>
       {recent.length > 0 && (
@@ -2161,6 +2528,78 @@ export function HelpView({ state, dispatch }: { state: UiState; dispatch: Dispat
         </div>
       </div>
     </section>
+  );
+}
+
+// Search output lines are "path:line:text". Each becomes a link that opens a
+// read-only preview of the current file at that line (PG-033).
+function SearchResults({ output, onOpen }: { output: string; onOpen: (file: string, line: number) => void }): JSX.Element | null {
+  const results = output.split("\n").flatMap((entry) => {
+    const match = /^([^:\n]+):(\d+):(.*)$/u.exec(entry);
+    return match === null ? [] : [{ file: match[1] ?? "", line: Number(match[2]), text: match[3] ?? "" }];
+  });
+  if (results.length === 0) return null;
+  return (
+    <section className="inspector-section">
+      <h3>Ocorrências ({results.length})</h3>
+      <ul className="search-results">
+        {results.slice(0, 200).map((result, index) => (
+          <li key={`${result.file}:${result.line}:${index}`}>
+            <button type="button" className="linklike" onClick={() => { onOpen(result.file, result.line); }}>{result.file}:{result.line}</button>
+            <code>{result.text.trim()}</code>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function FilePreview({ api, taskId, path, line, onClose }: { api: ApiClient; taskId: string; path: string; line: number | null; onClose: () => void }): JSX.Element {
+  const [file, setFile] = useState<{ content: string; truncated: boolean } | null>(null);
+  const [error, setError] = useState("");
+  const target = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    let cancelled = false;
+    setFile(null);
+    setError("");
+    api.filePreview(taskId, path).then((result) => { if (!cancelled) setFile(result); }).catch((reason: unknown) => { if (!cancelled) setError(reason instanceof Error ? reason.message : "Prévia indisponível."); });
+    return () => { cancelled = true; };
+  }, [api, taskId, path]);
+  useEffect(() => { target.current?.scrollIntoView({ block: "center" }); }, [file, line]);
+  return (
+    <section className="inspector-section file-preview" aria-label={`Prévia de ${path}`}>
+      <div className="file-preview-head">
+        <h3>{path}{line === null ? "" : `:${line}`}</h3>
+        <CopyButton text={path} label="Copiar caminho" />
+        <button type="button" className="btn" onClick={onClose}>Fechar</button>
+      </div>
+      <p className="meta">Conteúdo atual do arquivo (somente leitura). Pode ter mudado desde a execução da ferramenta.</p>
+      {error !== "" && <p className="meta error" role="alert">{error}</p>}
+      {file === null && error === "" && <p className="meta" role="status">Carregando…</p>}
+      {file !== null && (
+        <pre className="output numbered" tabIndex={0}>
+          {file.content.split("\n").map((text, index) => (
+            <span key={index} ref={line === index + 1 ? target : undefined} className={line === index + 1 ? "line hit" : "line"}><span className="ln">{index + 1}</span>{text}{"\n"}</span>
+          ))}
+        </pre>
+      )}
+      {file?.truncated === true && <p className="meta">Prévia limitada aos primeiros 256 KB.</p>}
+    </section>
+  );
+}
+
+// Lazy, inline view of an edit's changes right under its row in the timeline.
+function InlineDiff({ api, taskId, tool }: { api: ApiClient; taskId: string; tool: ToolActivityView }): JSX.Element {
+  const [full, setFull] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  return (
+    <details className="inline-diff" onToggle={(event) => {
+      if (!event.currentTarget.open || full !== null) return;
+      api.toolDetail(taskId, tool.id).then((result) => { setFull(result.detail); }).catch(() => { setFailed(true); });
+    }}>
+      <summary>Ver alterações em {tool.target ?? "arquivo"}</summary>
+      {full !== null ? <DiffView full={full} /> : failed ? <p className="meta">Alterações indisponíveis.</p> : <p className="meta" role="status">Carregando…</p>}
+    </details>
   );
 }
 

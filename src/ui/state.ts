@@ -34,6 +34,9 @@ export interface UiState {
   resyncTarget?: number;
   view: UiView;
   sessionFilter: string;
+  // Bumped whenever something may have changed the session list.
+  sessionsVersion?: number;
+  showArchived?: boolean;
 }
 
 export const initialState: UiState = {
@@ -63,9 +66,13 @@ export type UiAction =
   | { type: "draft"; draft: string }
   | { type: "task-draft"; taskId: string; draft: string }
   | { type: "command-failed"; commandId: string; taskId: string; error: string }
+  | { type: "command-done"; commandId: string }
+  | { type: "sessions-stale" }
+  | { type: "show-archived"; show: boolean }
   | { type: "clear-action-error" }
   | { type: "select-detail"; detailId: string | null }
   | { type: "toggle-sidebar" }
+  | { type: "sidebar"; open: boolean }
   | { type: "command-sent"; command: PendingCommand }
   | { type: "set-view"; view: UiView }
   | { type: "session-filter"; filter: string }
@@ -102,12 +109,15 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
         .concat(action.snapshot.tools.map((t) => t.id))
         .concat(action.snapshot.verifications.map((v) => v.id))
         .concat(action.snapshot.steering.map((s) => s.id));
+      // A pending message is settled once the ledger carries its identity
+      // (msg-<commandId>); text equality is kept only for older servers.
       const pending = state.pending.filter((command) => {
         if (command.kind !== "steer" && command.kind !== "stop") return true;
         if (command.kind === "stop") {
           return action.snapshot.state === "RUNNING";
         }
-        return !action.snapshot.steering.some((entry) => entry.text === command.text);
+        return !action.snapshot.messages.some((message) => message.id === `msg-${command.commandId}`)
+          && !action.snapshot.steering.some((entry) => entry.text === command.text);
       });
       return {
         ...state,
@@ -127,10 +137,9 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       if (state.task === null) return { ...state, lastSeq: event.seq };
       const task = applyEvent(state.task, event);
       if (task === null) return { ...state, lastSeq: event.seq };
-      const pending =
-        event.kind === "state" && (event.state === "CANCELLED" || event.state === "COMPLETED" || event.state === "BLOCKED")
-          ? state.pending.filter((command) => command.kind !== "stop")
-          : state.pending;
+      const pending = (event.kind === "state" && (event.state === "CANCELLED" || event.state === "COMPLETED" || event.state === "BLOCKED")
+        ? state.pending.filter((command) => command.kind !== "stop")
+        : state.pending).filter((command) => !(event.kind === "message" && event.message.id === `msg-${command.commandId}`));
       // State frames do not contain the resume gate. Refresh it after a
       // run settles instead of retaining a RUNNING snapshot's active-runtime.
       const refreshGate = event.kind === "state" && event.state !== "RUNNING";
@@ -152,12 +161,20 @@ export function uiReducer(state: UiState, action: UiAction): UiState {
       return state.activeTaskId === action.taskId ? { ...state, draft: action.draft } : { ...state, drafts: { ...state.drafts, [action.taskId]: action.draft } };
     case "command-failed":
       return state.activeTaskId === action.taskId ? { ...state, actionError: action.error, pending: state.pending.filter(command => command.commandId !== action.commandId) } : state;
+    case "show-archived":
+      return { ...state, showArchived: action.show, sessionsVersion: (state.sessionsVersion ?? 0) + 1 };
+    case "sessions-stale":
+      return { ...state, sessionsVersion: (state.sessionsVersion ?? 0) + 1 };
+    case "command-done":
+      return { ...state, pending: state.pending.filter(command => command.commandId !== action.commandId) };
     case "clear-action-error":
       return { ...state, actionError: null };
     case "select-detail":
       return { ...state, detailId: action.detailId };
     case "toggle-sidebar":
       return { ...state, sidebarOpen: !state.sidebarOpen };
+    case "sidebar":
+      return state.sidebarOpen === action.open ? state : { ...state, sidebarOpen: action.open };
     case "command-sent":
       return { ...state, pending: [...state.pending, action.command] };
     case "set-view":
@@ -220,6 +237,8 @@ export function stateLabel(state: TaskState): string {
       return "Concluído";
     case "CANCELLED":
       return "Interrompido";
+    case "INTERRUPTED":
+      return "Interrompida por falha";
   }
 }
 

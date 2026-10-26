@@ -19,7 +19,7 @@ await build({
   outfile: path.join(outdir, "app.js"),
   logLevel: "warning",
 });
-for (const file of ["index.html", "app.css"]) {
+for (const file of ["index.html", "app.css", "favicon.svg"]) {
   fs.copyFileSync(path.join(root, "src", "ui", file), path.join(outdir, file));
 }
 process.stdout.write("ui: bundled to dist/ui\n");

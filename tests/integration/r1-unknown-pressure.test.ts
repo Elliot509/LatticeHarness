@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileSurface, type TaskSurface } from "../../src/context/compiler.js";
+import { compileConversation, type TaskSurface } from "../../src/context/compiler.js";
 import { unknownHistory } from "../../src/runtime/continuity.js";
 import { createContract } from "../../src/runtime/contract.js";
 import {
@@ -84,12 +84,13 @@ describe("r1 unknown under context pressure", () => {
       versions: [],
       lastError: null,
     };
-    // Flood evidence to the limit: anchors must survive, evidence drops.
-    const flood = Array.from({ length: 200 }, (_, i) => ({ id: `ev-${i}`, text: "x".repeat(500) }));
-    const compiled = compileSurface(surface, flood, { maxChars: 4000 });
-    expect(compiled.task).toContain("edit effect uncertain");
-    expect(compiled.task).toContain(admitted.attemptId);
+    // Flood the exchange to the limit: anchors must survive, turns drop.
+    const flood = Array.from({ length: 200 }, (_, i) => ({ kind: "runtime" as const, seq: i, text: "x".repeat(500), taskId: "task-1" }));
+    const compiled = compileConversation(surface, [{ kind: "user", seq: -1, text: "go", taskId: "task-1" }, ...flood], { maxChars: 4000 });
+    expect(compiled.system).toContain("edit effect uncertain");
+    expect(compiled.system).toContain(admitted.attemptId);
+    expect(compiled.turnsOmitted).toBeGreaterThan(0);
     // And when even the anchors do not fit, the compiler refuses (path B).
-    expect(() => compileSurface(surface, [], { maxChars: 10 })).toThrow();
+    expect(() => compileConversation(surface, [], { maxChars: 10 })).toThrow();
   });
 });

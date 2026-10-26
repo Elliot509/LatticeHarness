@@ -9,7 +9,7 @@ import type { DirectoryPage, DirectoryEntry } from "../tools/directory.js";
 export type AcceptancePredicate =
   | { kind: "directory-exists" | "file-exists"; path: string }
   | { kind: "directory-listing"; path: string; recursive: boolean; filter: "all" | "files" | "directories" }
-  | { kind: "tests-pass" | "response" | "clarification-required" };
+  | { kind: "tests-pass" | "response" | "clarification-required" | "unverified" };
 
 const LOCAL_LOCATION = String.raw`(?:(?:dentro\s+(?:desta|dessa|deste|desse|esta|essa|este|esse))|(?:nesta|nessa|neste|nesse|no))\s+(?:pasta|diret[oó]rio|lugar|projeto|ambiente)|aqui`;
 const CLARIFY = "Defina um alvo, escopo e critério explícitos; operações adicionais ou localização ambígua precisam de confirmação.";
@@ -17,7 +17,7 @@ const CLARIFY = "Defina um alvo, escopo e critério explícitos; operações adi
 export interface AcceptanceResolution {
   criteria: string[];
   source: "explicit" | "default";
-  policyVersion: "acceptance-3";
+  policyVersion: "acceptance-4";
   reason: string;
 }
 
@@ -61,16 +61,30 @@ function listingCriterion(objective: string): string | null {
   return `directory-listing:${filter}:${match[5] === undefined ? "immediate" : "recursive"}:.`;
 }
 
+const MUTATION = /\b(?:corri(?:ja|jam|gir|ge|gindo)|consert(?:e|ar|em|ando)|arrum(?:e|ar|em)|modifi(?:que|car|quem)|alter(?:e|ar|em|ando)|implement(?:e|ar|em|ando)|adicion(?:e|ar|em)|cri(?:e|ar|em|ando)|remov(?:a|e|er|am)|apag(?:ue|ar|uem)|delet(?:e|ar)|renomei(?:e|ar)|renomear|mov(?:a|er|am)|refator(?:e|ar)|atualiz(?:e|ar|em)|escrev(?:a|er|am)|edit(?:e|ar|em)|instal(?:e|ar)|organiz(?:e|ar|em)|fix|fixes|change|modify|implement|add|create|remove|delete|rename|move|refactor|update|write|edit|install|organi[sz]e)\b/iu;
+const TESTS = /\b(?:testes?|tests?|pytest|vitest|jest|mocha|npm\s+test|cargo\s+test|go\s+test|su[ií]te\s+de\s+testes)\b/iu;
+const ANALYSIS = /^(?:(?:por favor|please)[, ]+)?(?:(?:voc[eê]|vc|you)\s+)?(?:(?:pode|poderia|consegue|can|could)\s+(?:me\s+)?)?(?:expli(?:que|car|ca)|explain|anal[yi]s[ea]\w*|resum\w*|summari[sz]e|inspect\w*|inspecion\w*|read|leia|ler|descrev\w*|describe|revis\w*|review|avali\w*|diagn[oó]stic\w*|compare|compar\w*|o\s+que\s+(?:faz|é|significa))\b/iu;
+const QUESTION_WORD = /^(?:(?:e|and|ent[aã]o|mas|but|so|ok)[, ]+)?(?:como|por\s*qu[eê]|porque|o\s+que|qual|quais|onde|quando|quem|quanto|quantos|quantas|what|why|how|which|where|when|who)\b/iu;
+
 export function resolveAcceptance(objective: string, explicit: readonly string[] = []): AcceptanceResolution {
+  const version = "acceptance-4" as const;
   // Do not run heuristics at all when the human supplied criteria.
-  if (explicit.length > 0) return { criteria: [...explicit], source: "explicit", policyVersion: "acceptance-3", reason: "user-defined criteria" };
+  if (explicit.length > 0) return { criteria: [...explicit], source: "explicit", policyVersion: version, reason: "user-defined criteria" };
+  const text = objective.trim();
   const creation = creationCriterion(objective);
-  if (creation !== null) return { criteria: [creation], source: "default", policyVersion: "acceptance-3", reason: creation === "clarification-required" ? "filesystem creation needs an explicit target or criterion" : "single bounded filesystem creation" };
+  if (creation !== null) return { criteria: [creation], source: "default", policyVersion: version, reason: creation === "clarification-required" ? "filesystem creation needs an explicit target or criterion" : "single bounded filesystem creation" };
   const listing = listingCriterion(objective);
-  if (listing !== null) return { criteria: [listing], source: "default", policyVersion: "acceptance-3", reason: "bounded directory inventory; immediate children unless recursion explicitly requested" };
-  if (/^(?:por favor[, ]+)?(?:(?:me\s+)?(?:liste|listar|mostre|mostrar|list|show)\b|quais\s+(?:arquivos|diret[oó]rios|pastas)\b)/iu.test(objective.trim()) && !/\b(?:corrija|modifique|implemente|apague|remova|crie|execute)\b/iu.test(objective)) return { criteria: ["clarification-required"], source: "default", policyVersion: "acceptance-3", reason: "inventory scope or additional obligations need clarification" };
-  if (/^(?:por favor[, ]+)?(?:expli(?:que|car)|explain|anal[yi]s[ei]|resuma|summari[sz]e|inspect|inspecione|read|leia|diagn[oó]stico)\b/iu.test(objective.trim()) && !/\b(?:corrija|modifique|implemente|apague|remova|crie)\b/iu.test(objective)) return { criteria: ["response"], source: "default", policyVersion: "acceptance-3", reason: "analysis response" };
-  return { criteria: ["tests-pass"], source: "default", policyVersion: "acceptance-3", reason: "coding verification" };
+  if (listing !== null) return { criteria: [listing], source: "default", policyVersion: version, reason: "bounded directory inventory; immediate children unless recursion explicitly requested" };
+  if (/^(?:por favor[, ]+)?(?:(?:me\s+)?(?:liste|listar|mostre|mostrar|list|show)\b|quais\s+(?:arquivos|diret[oó]rios|pastas)\b)/iu.test(text) && !/\b(?:corrija|modifique|implemente|apague|remova|crie|execute)\b/iu.test(objective)) return { criteria: ["clarification-required"], source: "default", policyVersion: version, reason: "inventory scope or additional obligations need clarification" };
+  // The deliverable of an explanation or a question is the answer itself.
+  // Any mutation verb anywhere disqualifies it: an answer never certifies a change.
+  const asksAnswer = (ANALYSIS.test(text) || (QUESTION_WORD.test(text) && /\?\s*$/u.test(text))) && !MUTATION.test(text.replace(QUESTION_WORD, "").replace(/^\s*(?:corrijo|conserto|arrumo|fa[cç]o)\b/iu, ""));
+  if (asksAnswer) return { criteria: ["response"], source: "default", policyVersion: version, reason: "analysis or question: the answer is the deliverable" };
+  // Tests named explicitly: completion requires observed passing tests.
+  if (TESTS.test(text)) return { criteria: ["tests-pass"], source: "default", policyVersion: version, reason: "tests named in the request" };
+  // Everything else changes things in ways no generic predicate can certify:
+  // the run ends awaiting human review, never concluded by model text.
+  return { criteria: ["unverified"], source: "default", policyVersion: version, reason: "no automatic verifier for this request; human review decides" };
 }
 
 export function defaultAcceptance(objective: string): string[] {
@@ -83,6 +97,7 @@ function predicate(text: string): AcceptancePredicate | null {
   const match = /^(directory-exists|file-exists):(.+)$/u.exec(text);
   if (match?.[1] && match[2]) return { kind: match[1] as "directory-exists" | "file-exists", path: match[2] };
   if (text === "response") return { kind: "response" };
+  if (text === "unverified") return { kind: "unverified" };
   if (text === "clarification-required") return { kind: "clarification-required" };
   if (text === "tests-pass" || /^(?:project test suite passes|tests pass|task completed as verified)$/iu.test(text)) return { kind: "tests-pass" };
   return null;
@@ -229,13 +244,15 @@ export class TaskAcceptance {
 
   get clarificationReason(): string | null { return this.checks.some(check => check?.kind === "clarification-required") ? CLARIFY : null; }
 
-  async check(finalText?: string): Promise<{ complete: boolean; reason: string; finalText?: string }> {
+  async check(finalText?: string): Promise<{ complete: boolean; reason: string; finalText?: string; review?: boolean }> {
     const observed: string[] = [];
     const responses: string[] = [];
     let current: WorkspaceSnapshot | null = null;
+    let review = false;
     for (const [index, check] of this.checks.entries()) {
       if (check === null) return { complete: false, reason: `criterion needs an explicit verifier: ${this.criteria[index]}` };
       if (check.kind === "clarification-required") return { complete: false, reason: CLARIFY };
+      if (check.kind === "unverified") { review = true; continue; }
       if (check.kind === "directory-listing") {
         const target = resolveInScope(this.root, check.path);
         const root = resolveInScope(this.root, ".");
@@ -271,6 +288,9 @@ export class TaskAcceptance {
         observed.push(`analysis response provided; filesystem correctness not certified${this.mutated ? "; exec/edit effects are not certified by response" : ""}`);
       }
     }
+    // "unverified" never concludes by itself: the run ends awaiting a human
+    // decision, with the other criteria's observations already checked.
+    if (review) return { complete: false, review: true, reason: `result awaits human review: no automatic verifier for this request${observed.length > 0 ? `; observed: ${observed.join("; ")}` : ""}` };
     return { complete: observed.length > 0, reason: observed.join("; ") || "no acceptance criteria", ...(responses.length > 0 ? { finalText: responses.join("\n\n") } : {}) };
   }
 }

@@ -38,7 +38,7 @@ function createReady(tasks: TaskManager) {
   const result = tasks.handleCommand({
     commandId: "cmd-create-1",
     kind: "create-task",
-    payload: { workspace: "", objective: "Fix the bug", provider: "openai", model: "m1", baseUrl: "http://127.0.0.1:9" },
+    payload: { workspace: "", objective: "Fix the bug and run the tests", provider: "openai", model: "m1", baseUrl: "http://127.0.0.1:9" },
   });
   if (!result.accepted) throw new Error("create-task denied");
   return result.taskId;
@@ -254,6 +254,6 @@ describe("task commands", () => {
     expect(snapshot.budget).toMatchObject({ grantedCalls: null, grantedTokens: null });
     expect(snapshot.unknowns).toBe(0);
     expect(snapshot.contextUsage).toEqual({ known: false });
-    expect(snapshot.messages[0]).toMatchObject({ author: "user", text: "Fix the bug" });
+    expect(snapshot.messages[0]).toMatchObject({ author: "user", text: "Fix the bug and run the tests" });
   });
 });

@@ -53,9 +53,11 @@ export interface WorkspaceEntry {
 
 export interface ApiClient {
   info(): Promise<{ workspace: string }>;
-  sessions(): Promise<SessionSummary[]>;
+  acceptancePreview(objective: string): Promise<{ criteria: string[]; reason: string }>;
+  sessions(includeArchived?: boolean): Promise<SessionSummary[]>;
   snapshot(taskId: string): Promise<TaskSnapshot>;
   toolDetail(taskId: string, attemptId: string): Promise<{ detail: string; truncated: boolean; argsJson?: string | null; argsTruncated?: boolean }>;
+  filePreview(taskId: string, path: string): Promise<{ path: string; content: string; truncated: boolean; size: number }>;
   command(command: UiCommand): Promise<CommandResult>;
   subscribe(taskId: string, onEvent: (event: UiEvent) => void, onStatus: (status: "live" | "dropped") => void): () => void;
   providers(): Promise<ProviderPresetView[]>;
@@ -95,8 +97,14 @@ export function createApi(base: string): ApiClient {
     return (await response.json()) as { workspace: string };
   }
 
-  async function sessions(): Promise<SessionSummary[]> {
-    const response = await fetch(`${base}/api/sessions`);
+  async function acceptancePreview(objective: string): Promise<{ criteria: string[]; reason: string }> {
+    const response = await fetch(`${base}/api/acceptance-preview?objective=${encodeURIComponent(objective)}`);
+    if (!response.ok) throw new Error(await readError(response));
+    return (await response.json()) as { criteria: string[]; reason: string };
+  }
+
+  async function sessions(includeArchived = false): Promise<SessionSummary[]> {
+    const response = await fetch(`${base}/api/sessions${includeArchived ? "?archived=1" : ""}`);
     if (!response.ok) throw new Error(await readError(response));
     const body = (await response.json()) as { sessions: SessionSummary[] };
     return body.sessions;
@@ -114,6 +122,12 @@ export function createApi(base: string): ApiClient {
     );
     if (!response.ok) throw new Error(await readError(response));
     return (await response.json()) as { detail: string; truncated: boolean };
+  }
+
+  async function filePreview(taskId: string, filePath: string): Promise<{ path: string; content: string; truncated: boolean; size: number }> {
+    const response = await fetch(`${base}/api/tasks/${encodeURIComponent(taskId)}/file?path=${encodeURIComponent(filePath)}`);
+    if (!response.ok) throw new Error(await readError(response));
+    return (await response.json()) as { path: string; content: string; truncated: boolean; size: number };
   }
 
   async function command(command: UiCommand): Promise<CommandResult> {
@@ -241,6 +255,8 @@ export function createApi(base: string): ApiClient {
 
   return {
     info,
+    acceptancePreview,
+    filePreview,
     sessions,
     snapshot,
     toolDetail,

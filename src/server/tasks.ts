@@ -8,19 +8,25 @@ import os from "node:os";
 import { normalizeEndpoint, requireCredentialTransport } from "../providers/endpoint.js";
 import { createContract, reviseContract, type TaskContract } from "../runtime/contract.js";
 import {
+  acceptTaskResult,
+  acknowledgeUnknownEffects,
   evaluateResumeGate,
   grantedFromContract,
   openRun,
   openSession,
+  readHumanDecisions,
   recordTaskEvent,
+  recoverOrphanedTasks,
   resumeTask as resumeTaskInDb,
   unknownHistory,
 } from "../runtime/continuity.js";
 import { HandleWaiter, edgeWakeId, levelWakeId, listActiveWaits, recordWake, notePendingRevision, takePendingRevisions } from "../runtime/wait.js";
 import { advanceCompositionEpoch, compositionForRoute } from "../runtime/composition.js";
-import { taskBudgetSnapshot } from "../runtime/effects.js";
+import { reconcileUnknownAttempt, taskBudgetSnapshot, uncertainReservationTotals, type ReconcileDecision } from "../runtime/effects.js";
 import type { BudgetGrant } from "../runtime/budget.js";
 import { runTaskLoop, type LoopOptions, type LoopStop } from "../runtime/loop.js";
+import { conversationWithLineage, recordToolResult, taskLineage, unansweredCalls } from "../runtime/conversation.js";
+import { approvalHistory, approvalPolicy, decideApproval as decideApprovalInDb, pendingApprovals, withdrawApproval } from "../runtime/approval.js";
 import { buildToolset } from "../tools/registry.js";
 import { ProcessSupervisor } from "../tools/process.js";
 import { summarizeExecResult } from "../runtime/verify.js";
@@ -37,6 +43,8 @@ import {
   type MessageView,
   type SessionSummary,
   type SteeringView,
+  type TaskCapabilities,
+  type TaskOutcome,
   type TaskSnapshot,
   type TaskState,
   type ToolActivityView,
@@ -47,6 +55,7 @@ import {
 
 export const PACKAGE_VERSION = "0.0.0";
 const MAX_RING = 500;
+const MAX_APPROVAL_ARGS_CHARS = 64_000;
 
 export interface LiveRun {
   abort: AbortController;
@@ -67,6 +76,7 @@ export interface ServerTaskOptions {
   baseUrl: string | null;
   budget?: BudgetGrant;
   expiresAt?: string | null;
+  approvalPolicy?: "none" | "confirm-mutations";
 }
 
 interface StoredSteering {
@@ -82,6 +92,10 @@ interface StoredSteering {
 
 export class TaskManager {
   private readonly live = new Map<string, LiveRun>();
+  // FIFO of tasks whose start was requested while another task ran. One
+  // executor at a time: no two runs write the same project concurrently.
+  // In memory on purpose: after a restart nothing starts by itself.
+  private readonly queue: string[] = [];
   private readonly keys = new Map<string, string>();
   private readonly processedCommands = new Map<string, CommandResult>();
   private readonly rings = new Map<string, UiEvent[]>();
@@ -113,6 +127,15 @@ export class TaskManager {
     this.defaultGrants = defaultGrants;
     this.productDir = productDir;
     this.nativeProjectSelection = nativeProjectSelection;
+    // This manager is the only executor for its database owner generation.
+    // Anything still claiming RUNNING under another generation lost its
+    // executor; make that observable instead of leaving an immortal task.
+    try {
+      recoverOrphanedTasks(db, this.readGeneration());
+    } catch {
+      // Recovery failure must not prevent opening history; the gate still
+      // classifies pending intents on an explicit resume.
+    }
   }
 
   /** Device-global product config directory, or null when not configured. */
@@ -137,6 +160,7 @@ export class TaskManager {
   close(): Promise<void> {
     if (this.closing !== null) return this.closing;
     this.draining = true;
+    this.queue.splice(0);
     const runs = [...this.live.values()];
     for (const live of runs) {
       live.stopRequested = true;
@@ -309,6 +333,31 @@ export class TaskManager {
     return { attemptId, detail: truncated ? text.slice(0, 64 * 1024) : text, truncated, argsJson: args?.slice(0, 64 * 1024) ?? null, argsTruncated: (args?.length ?? 0) > 64 * 1024 };
   }
 
+  // Read-only preview of a workspace file for the inspector (search results,
+  // read targets). Contained in the task's own scope (symlink-safe), regular
+  // files only, text only, bounded. Not a tool call: nothing is recorded.
+  filePreview(taskId: string, requested: string): { path: string; content: string; truncated: boolean; size: number } {
+    const contract = this.contractOf(taskId);
+    const root = contract.scope[0] ?? this.serverWorkspace;
+    if (requested.trim() === "" || path.isAbsolute(requested)) throw new Error("relative project path required");
+    const absolute = resolveInScope(root, requested);
+    if (absolute === null) throw new Error("path is outside the project");
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile()) throw new Error("not a regular file");
+    const limit = 256 * 1024;
+    const handle = fs.openSync(absolute, "r");
+    try {
+      const buffer = Buffer.alloc(Math.min(stat.size, limit));
+      const read = fs.readSync(handle, buffer, 0, buffer.length, 0);
+      const bytes = buffer.subarray(0, read);
+      if (bytes.includes(0)) throw new Error("binary file; preview unavailable");
+      const content = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+      return { path: requested, content, truncated: stat.size > limit, size: stat.size };
+    } finally {
+      fs.closeSync(handle);
+    }
+  }
+
   missedEvents(taskId: string, afterSeq: number): { events: UiEvent[]; resync: boolean } {
     // Broadcast seqs continue past persisted history; the snapshot always
     // covers everything older. Resync is only needed when broadcast events
@@ -359,13 +408,13 @@ export class TaskManager {
     this.contracts.set(contract.taskId, contract);
   }
 
-  listSessions(): SessionSummary[] {
+  listSessions(includeArchived = false): SessionSummary[] {
     const rows = this.db
       .prepare(
         `SELECT r.run_id, r.session_id, r.root_id, r.task_id, r.created_at, c.document
          FROM runs r LEFT JOIN contracts c ON c.task_id = r.task_id
-         WHERE r.created_at = (SELECT MAX(created_at) FROM runs WHERE task_id = r.task_id)
-         ORDER BY r.created_at DESC LIMIT 100`,
+         WHERE r.rowid = (SELECT rowid FROM runs WHERE task_id = r.task_id ORDER BY created_at DESC, rowid DESC LIMIT 1)
+         ORDER BY r.created_at DESC LIMIT 300`,
       )
       .all() as Array<{
       run_id: string;
@@ -375,7 +424,7 @@ export class TaskManager {
       created_at: string;
       document: string | null;
     }>;
-    return rows.map((row) => {
+    return rows.filter((row) => includeArchived || !this.isArchived(row.task_id)).slice(0, 100).map((row) => {
       let objective = "";
       let workspace = this.serverWorkspace;
       if (row.document !== null) {
@@ -397,6 +446,10 @@ export class TaskManager {
         objective,
         state: this.readState(row.task_id).state,
         updatedAt: row.created_at,
+        parentTaskId: taskLineage(this.db, row.task_id, 1)[0] ?? null,
+        outcome: this.outcome(row.task_id, this.readState(row.task_id).state).kind,
+        queuePosition: this.queuePosition(row.task_id),
+        archived: this.isArchived(row.task_id),
       };
     });
   }
@@ -417,8 +470,8 @@ export class TaskManager {
     return { state: "READY", reason: "created" };
   }
 
-  private setState(taskId: string, state: TaskState, reason: string): void {
-    this.recordEvent(taskId, "task-state", { state, reason });
+  private setState(taskId: string, state: TaskState, reason: string, extra: Record<string, unknown> = {}): void {
+    this.recordEvent(taskId, "task-state", { state, reason, ...extra });
     this.emit(taskId, { seq: 0, kind: "budget", budget: this.readBudget(taskId) });
     this.emit(taskId, { seq: 0, kind: "state", state, reason, contractRevision: this.contractOf(taskId).revision });
   }
@@ -455,6 +508,7 @@ export class TaskManager {
       expiresAt: options.expiresAt ?? null,
       retentionPolicy: "retain until explicit deletion",
       origin: "ui create-task",
+      ...(options.approvalPolicy === "confirm-mutations" ? { approvalPolicy: "confirm-mutations" as const } : {}),
     });
     this.writeContract(contract);
     this.recordEvent(taskId, "acceptance-policy", { source: acceptance.source, policyVersion: acceptance.policyVersion, reason: acceptance.reason, revision: contract.revision });
@@ -494,9 +548,19 @@ export class TaskManager {
   startTask(taskId: string, commandId: string, adapterOverride?: ProviderAdapter): CommandResult {
     const contract = this.contractOf(taskId);
     const current = this.readState(taskId);
-    if (this.draining || this.live.size !== 0 || current.state !== "READY") {
-      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state };
+    if (!this.draining && current.state === "READY" && this.live.size !== 0 && !this.live.has(taskId) && adapterOverride === undefined) {
+      if (!this.queue.includes(taskId)) {
+        this.queue.push(taskId);
+        this.recordEvent(taskId, "task.queued", { position: this.queue.length });
+      }
+      this.emit(taskId, { seq: 0, kind: "state", state: "READY", reason: `queued: starts when the running task finishes (position ${this.queue.indexOf(taskId) + 1})`, contractRevision: contract.revision });
+      return { accepted: true, commandId, taskId, revision: contract.revision, state: "READY", detail: `Outra tarefa está em execução; esta entrou na fila (posição ${this.queue.indexOf(taskId) + 1}) e começa sozinha quando a atual terminar.` };
     }
+    if (this.draining || this.live.size !== 0 || current.state !== "READY") {
+      const detail = this.draining ? "O aplicativo está encerrando." : current.state !== "READY" ? "A tarefa não está pronta para iniciar." : "Outra tarefa está em execução.";
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state, detail };
+    }
+    this.dequeue(taskId);
     const acceptance = new TaskAcceptance(contract.scope[0] ?? this.serverWorkspace, contract.acceptanceCriteria);
     if (acceptance.clarificationReason !== null) {
       this.recordEvent(taskId, "chat", { author: "agent", text: acceptance.clarificationReason });
@@ -504,7 +568,13 @@ export class TaskManager {
       return { accepted: true, commandId, taskId, revision: contract.revision, state: "NEEDS_INPUT" };
     }
     const manifest = this.readManifest(taskId);
-    const adapter = adapterOverride ?? this.buildAdapter(manifest.provider, manifest.baseUrl);
+    let adapter: ProviderAdapter;
+    try {
+      adapter = adapterOverride ?? this.buildAdapter(manifest.provider, manifest.baseUrl);
+    } catch (error) {
+      const detail = this.missingCredential(manifest.provider, manifest.baseUrl) ?? `Não foi possível preparar o provedor: ${error instanceof Error ? error.message : "configuração inválida"}.`;
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state, detail };
+    }
     const supervisor = new ProcessSupervisor(contract.scope[0] ?? this.serverWorkspace);
     const live: LiveRun = {
       abort: new AbortController(),
@@ -616,7 +686,7 @@ export class TaskManager {
         surface.prohibitions = [...contract.prohibitions];
         surface.obligations = [...contract.obligations];
         if (acceptance.inventoryInstruction !== null) surface.obligations = [...surface.obligations, acceptance.inventoryInstruction];
-        surface.humanDecisions = this.storedSteerings(taskId).map((record) => record.text);
+        surface.humanDecisions = readHumanDecisions(this.db, taskId);
         surface.unknowns = unknownHistory(this.db, taskId).map((entry) => `${entry.attemptId}: ${entry.reason}`);
       },
       onRequestBound: (binding) => {
@@ -635,6 +705,7 @@ export class TaskManager {
         return check;
       }],
       verifyAfterTools: acceptance.hasFilesystemPredicate,
+      conversation: () => conversationWithLineage(this.db, taskId),
       waiter,
       awaitWake: async (wait) => {
         this.emit(taskId, { seq: 0, kind: "budget", budget: this.readBudget(taskId) });
@@ -657,7 +728,9 @@ export class TaskManager {
         else this.recordEvent(taskId, "chat", { author: "agent", text, source });
       },
     };
-    this.setState(taskId, "RUNNING", "loop started");
+    // The owner generation marks which executor this RUNNING belongs to, so
+    // a later owner can tell a live run from an orphaned one.
+    this.setState(taskId, "RUNNING", "loop started", { generation });
     const finish = async (stop: LoopStop): Promise<LoopStop> => {
       const cleanup = await supervisor.close();
       for (const observation of cleanup) this.recordEvent(taskId, "process-cleanup", observation);
@@ -714,6 +787,14 @@ export class TaskManager {
     return new OpenAiAdapter({ apiKey, baseUrl: effectiveBase });
   }
 
+  // Product-language reason when a preset that needs a key has none for the
+  // endpoint that would be used; null when the route can be attempted.
+  missingCredential(provider: string, baseUrl: string | null): string | null {
+    const preset = findPreset(provider);
+    if (preset === null || !preset.keyRequired || baseUrl !== null || this.keyConfigured(provider, null)) return null;
+    return `Configure a chave de API de ${preset.displayName} antes de começar (Configurações › Providers, ou no seletor de modelo).`;
+  }
+
   private readGeneration(): number {
     const row = this.db.prepare("SELECT generation FROM ownership WHERE id = 1").get() as
       | { generation: number }
@@ -753,8 +834,17 @@ export class TaskManager {
     event: { kind: string; attemptId?: string; tool?: string; status?: string; toolCalls?: number; text?: string },
   ): void {
     if (event.kind === "wake") {
-      this.setState(taskId, "RUNNING", "durable process/wake observation; continuing the same activation");
+      this.setState(taskId, "RUNNING", "durable process/wake observation; continuing the same activation", { generation: this.readGeneration() });
       this.recordEvent(taskId, "chat", { author: "system", text: event.text ?? "wake observed" });
+      return;
+    }
+    // Live phase for the UI only (not persisted): what the run is doing now.
+    if (event.kind === "model-request") {
+      this.emit(taskId, { seq: 0, kind: "state", state: "RUNNING", reason: `working: waiting for the model response since ${new Date().toISOString()}`, contractRevision: this.contractOf(taskId).revision });
+      return;
+    }
+    if (event.kind === "provider-retry") {
+      this.emit(taskId, { seq: 0, kind: "state", state: "RUNNING", reason: `working: provider unreachable, retrying (attempt ${String((event as { attempt?: number }).attempt ?? "?")}) since ${new Date().toISOString()}`, contractRevision: this.contractOf(taskId).revision });
       return;
     }
     if (event.kind === "model-response") {
@@ -769,6 +859,7 @@ export class TaskManager {
       return;
     }
     if (event.kind === "tool-start" && event.tool !== undefined && event.attemptId !== undefined) {
+      this.emit(taskId, { seq: 0, kind: "state", state: "RUNNING", reason: `working: running ${event.tool} since ${new Date().toISOString()}`, contractRevision: this.contractOf(taskId).revision });
       const activitySeq = this.recordEvent(taskId, "tool-activity", { attemptId: event.attemptId });
       this.emit(taskId, {
         seq: 0,
@@ -850,6 +941,36 @@ export class TaskManager {
     notePendingRevision(this.db, taskId, Math.max(row.revision, this.contractOf(taskId).revision) + 1, payload);
   }
 
+  queuePosition(taskId: string): number | null {
+    const index = this.queue.indexOf(taskId);
+    return index === -1 ? null : index + 1;
+  }
+
+  private dequeue(taskId: string): boolean {
+    const index = this.queue.indexOf(taskId);
+    if (index === -1) return false;
+    this.queue.splice(index, 1);
+    this.recordEvent(taskId, "task.dequeued", {});
+    return true;
+  }
+
+  // Starts the next queued task once the executor is free. A queued task
+  // that is no longer READY (stopped, archived, closed) is skipped.
+  private startNextQueued(): void {
+    while (!this.draining && this.live.size === 0 && this.queue.length > 0) {
+      const next = this.queue[0];
+      if (next === undefined) return;
+      if (this.readState(next).state !== "READY") { this.dequeue(next); continue; }
+      try {
+        const started = this.startTask(next, `queue-${randomUUID().slice(0, 8)}`);
+        if (!started.accepted) this.dequeue(next);
+      } catch {
+        this.dequeue(next);
+      }
+      return;
+    }
+  }
+
   private onLoopStop(taskId: string, live: LiveRun, decision: string, reason: string, wait?: { kind: string }, cleanupUncertain = false): void {
     // A stable WAIT is not a completion: the loop already persisted the
     // WAITING/NEEDS_INPUT state, so only non-waiting outcomes transition here.
@@ -857,6 +978,7 @@ export class TaskManager {
       this.live.delete(taskId);
       const waiting: TaskState = wait.kind === "input" ? "NEEDS_INPUT" : "WAITING";
       this.emit(taskId, { seq: 0, kind: "state", state: waiting, reason, contractRevision: this.contractOf(taskId).revision });
+      queueMicrotask(() => { this.startNextQueued(); });
       return;
     }
     const state: TaskState = cleanupUncertain ? "BLOCKED" : live.stopRequested
@@ -870,12 +992,17 @@ export class TaskManager {
             : "CANCELLED";
     const finalReason = cleanupUncertain ? `${reason}; process cleanup remains UNKNOWN (see process-cleanup observations)` : live.stopRequested && state === "CANCELLED" ? `stop requested; ${reason}` : reason;
     this.live.delete(taskId);
-    this.setState(taskId, state, finalReason);
+    this.setState(taskId, state, finalReason, state === "COMPLETED" ? { basis: "verified" } : {});
+    queueMicrotask(() => { this.startNextQueued(); });
   }
 
-  steer(taskId: string, commandId: string, expectedRevision: number, text: string, mode: "guide" | "forbid"): CommandResult {
+  steer(taskId: string, commandId: string, expectedRevision: number, text: string, mode: "guide" | "forbid", messageId = `msg-${commandId}`): CommandResult {
     const contract = this.contractOf(taskId);
     const current = this.readState(taskId);
+    // Durable idempotency: a retried command (even after a restart wiped the
+    // in-memory command cache) never records the same message twice.
+    const existing = this.db.prepare("SELECT 1 AS hit FROM events WHERE task_id = ? AND kind = 'chat' AND json_extract(payload, '$.id') = ? LIMIT 1").get(taskId, messageId);
+    if (existing !== undefined) return { accepted: true, commandId, taskId, revision: contract.revision, state: current.state };
     if (this.draining || (current.state !== "RUNNING" && current.state !== "WAITING" && current.state !== "READY" && current.state !== "NEEDS_INPUT")) {
       return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state };
     }
@@ -885,12 +1012,15 @@ export class TaskManager {
     if (text.trim() === "") {
       return { accepted: false, commandId, reason: "invalid", revision: contract.revision, state: current.state };
     }
+    // A message is a conversation turn, not a contract obligation: it reaches
+    // the model as a user turn. The revision still marks the safe point where
+    // the human spoke. A "forbid" adds a prohibition (guidance, not enforcement).
     const revised =
       mode === "forbid"
         ? reviseContract(contract, { prohibitions: [...contract.prohibitions, text.trim()], origin: "ui steering" })
-        : reviseContract(contract, { obligations: [...contract.obligations, `user steering: ${text.trim()}`], origin: "ui steering" });
+        : reviseContract(contract, { origin: "ui message" });
     const record: StoredSteering = {
-      id: `steer-${randomUUID().slice(0, 8)}`,
+      id: messageId,
       seq: 0,
       text: text.trim(),
       mode,
@@ -922,8 +1052,12 @@ export class TaskManager {
     const contract = this.contractOf(taskId);
     const current = this.readState(taskId);
     const live = this.live.get(taskId);
+    if (live === undefined && this.dequeue(taskId)) {
+      this.emit(taskId, { seq: 0, kind: "state", state: current.state, reason: "removed from the queue by the user", contractRevision: contract.revision });
+      return { accepted: true, commandId, taskId, revision: contract.revision, state: current.state, detail: "Tarefa removida da fila." };
+    }
     if (live === undefined || (current.state !== "RUNNING" && current.state !== "WAITING" && current.state !== "NEEDS_INPUT")) {
-      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state };
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: current.state, detail: "Não há execução ativa desta tarefa neste aplicativo para interromper." };
     }
     live.stopRequested = true;
     live.abort.abort();
@@ -933,10 +1067,15 @@ export class TaskManager {
   // Manual resume over the wire: evaluates the ResumeGate and, only when it
   // allows, opens a new run under the same session. Never starts the loop;
   // the client sends start-task explicitly afterwards.
-  resumeTask(taskId: string, commandId: string): CommandResult {
+  resumeTask(taskId: string, commandId: string, acknowledgeUnknown = false): CommandResult {
     const contract = this.contractOf(taskId);
     if (this.draining || this.live.get(taskId) !== undefined) {
-      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: this.readState(taskId).state };
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: this.readState(taskId).state, detail: this.draining ? "O aplicativo está encerrando." : "A tarefa já está em execução." };
+    }
+    // Acknowledgement is an explicit human decision carried by this command,
+    // never implied by resuming: without it, UNKNOWN effects keep blocking.
+    if (acknowledgeUnknown) {
+      acknowledgeUnknownEffects(this.db, taskId, { actor: "human", note: "acknowledged to continue (resume-task)" });
     }
     // The resume run inherits the task composition so later reads of the
     // latest manifest keep working; only resume metadata is added.
@@ -949,10 +1088,233 @@ export class TaskManager {
     }
     const report = resumeTaskInDb(this.db, { taskId, generation: this.readGeneration(), packageVersion: PACKAGE_VERSION, manifestExtra: composition });
     if (!report.canResume) {
-      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: this.readState(taskId).state };
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state: this.readState(taskId).state, detail: describeBlockers(report.blockers) };
     }
     this.emit(taskId, { seq: 0, kind: "state", state: this.readState(taskId).state, reason: "resumed; ready to start", contractRevision: contract.revision });
     return { accepted: true, commandId, taskId, revision: contract.revision, state: this.readState(taskId).state };
+  }
+
+  // Reconciles one UNKNOWN effect by observation (edit, read/search), records
+  // an explicit human decision (exec/process/edit), or acknowledges it
+  // (model.invoke and anything the human chooses to carry forward).
+  reconcile(taskId: string, commandId: string, attemptId: string, action: "observe" | "acknowledge" | ReconcileDecision, note: string | null): CommandResult {
+    const contract = this.contractOf(taskId);
+    const state = this.readState(taskId).state;
+    if (this.draining || this.live.has(taskId)) {
+      return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, detail: "Reconcilie efeitos incertos com a tarefa parada." };
+    }
+    if (action === "acknowledge") {
+      const acknowledged = acknowledgeUnknownEffects(this.db, taskId, { actor: "human", note: note ?? "acknowledged in the task view", attemptIds: [attemptId] });
+      if (acknowledged.length === 0) return { accepted: false, commandId, reason: "invalid", revision: contract.revision, state, detail: "Esse efeito não está pendente de reconhecimento." };
+      this.emit(taskId, { seq: 0, kind: "resync", cut: this.seqs.get(taskId) ?? 0 });
+      return { accepted: true, commandId, taskId, revision: contract.revision, state, detail: "Incerteza reconhecida; o efeito continua registrado como incerto." };
+    }
+    const outcome = reconcileUnknownAttempt(this.db, taskId, attemptId, contract.scope[0] ?? this.serverWorkspace, action, "human", note);
+    this.emit(taskId, { seq: 0, kind: "budget", budget: this.readBudget(taskId) });
+    this.emit(taskId, { seq: 0, kind: "resync", cut: this.seqs.get(taskId) ?? 0 });
+    if (!outcome.reconciled) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, detail: outcome.detail };
+    return { accepted: true, commandId, taskId, revision: contract.revision, state, detail: outcome.detail };
+  }
+
+  // Records the human decision for one exact pending action, then continues
+  // the task so the decision takes effect (an approval runs that action once;
+  // a denial reaches the model as that call's result).
+  decideApproval(taskId: string, commandId: string, key: string, decision: "approved" | "denied", note: string | null): CommandResult {
+    const contract = this.contractOf(taskId);
+    const state = this.readState(taskId).state;
+    if (this.draining || this.live.has(taskId)) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, detail: this.draining ? "O aplicativo está encerrando." : "A tarefa está em execução." };
+    if (state === "COMPLETED") return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, detail: "A tarefa foi encerrada; a ação não será executada." };
+    if (!decideApprovalInDb(this.db, taskId, { key, decision, actor: "human", note })) {
+      return { accepted: false, commandId, reason: "invalid", revision: contract.revision, state, detail: "Não há um pedido de confirmação pendente para essa ação." };
+    }
+    if (state !== "READY") {
+      const resumed = this.resumeTask(taskId, `${commandId}:resume`);
+      if (!resumed.accepted) return { accepted: true, commandId, taskId, revision: contract.revision, state: this.readState(taskId).state, detail: `Decisão registrada. ${resumed.detail ?? "A tarefa não pôde continuar agora."}` };
+    }
+    const started = this.startTask(taskId, `${commandId}:start`);
+    return { accepted: true, commandId, taskId, revision: contract.revision, state: started.state, detail: decision === "approved" ? "Ação aprovada; a tarefa continua." : "Ação negada; o agente foi informado e a tarefa continua." };
+  }
+
+  // Archiving only hides a task from the default list. Nothing is deleted:
+  // the ledger, receipts and UNKNOWN history stay queryable and exportable.
+  archiveTask(taskId: string, commandId: string, archived: boolean): CommandResult {
+    const contract = this.contractOf(taskId);
+    const state = this.readState(taskId).state;
+    const capability = this.capabilities(taskId).archive;
+    if (archived && !capability.allowed) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, ...(capability.reason === undefined ? {} : { detail: capability.reason }) };
+    if (this.isArchived(taskId) === archived) return { accepted: true, commandId, taskId, revision: contract.revision, state };
+    this.dequeue(taskId);
+    this.recordEvent(taskId, "task.archived", { archived, actor: "human" });
+    this.emit(taskId, { seq: 0, kind: "resync", cut: this.seqs.get(taskId) ?? 0 });
+    return { accepted: true, commandId, taskId, revision: contract.revision, state, detail: archived ? "Tarefa arquivada. O histórico continua disponível em Arquivadas." : "Tarefa restaurada para a lista." };
+  }
+
+  isArchived(taskId: string): boolean {
+    const row = this.db.prepare("SELECT payload FROM events WHERE task_id = ? AND kind = 'task.archived' ORDER BY seq DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
+    if (row === undefined) return false;
+    try { return (JSON.parse(row.payload) as { archived?: unknown }).archived === true; } catch { return false; }
+  }
+
+  acceptResult(taskId: string, commandId: string, note: string | null): CommandResult {
+    const contract = this.contractOf(taskId);
+    const capability = this.capabilities(taskId).accept;
+    const state = this.readState(taskId).state;
+    if (!capability.allowed) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, ...(capability.reason === undefined ? {} : { detail: capability.reason }) };
+    const result = acceptTaskResult(this.db, taskId, { actor: "human", note });
+    if (!result.accepted) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, detail: result.reason === "nothing to accept yet" ? "Ainda não há resultado para aceitar." : "A tarefa já foi concluída." };
+    // Accepting closes the task: a confirmation still pending is withdrawn
+    // and its paused call answered as not run, so nothing can release it
+    // later and a follow-up inherits a well-formed conversation.
+    const paused = pendingApprovals(this.db, taskId);
+    if (paused.length > 0) {
+      const runId = (this.db.prepare("SELECT run_id FROM runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(taskId) as { run_id: string } | undefined)?.run_id ?? "";
+      for (const approval of paused) withdrawApproval(this.db, taskId, approval.key, "task closed: the human accepted the result as it is");
+      for (const call of unansweredCalls(this.db, taskId).calls) {
+        recordToolResult(this.db, taskId, { runId, toolCallId: call.id, name: call.name, attemptId: null, content: `[${call.name}] não executada: o usuário aceitou o resultado sem aprovar esta ação.` });
+      }
+    }
+    const current = this.readState(taskId);
+    this.emit(taskId, { seq: 0, kind: "budget", budget: this.readBudget(taskId) });
+    this.emit(taskId, { seq: 0, kind: "state", state: current.state, reason: current.reason, contractRevision: contract.revision });
+    return { accepted: true, commandId, taskId, revision: contract.revision, state: current.state, detail: "Resultado aceito por você. Isso registra sua decisão; não equivale a uma verificação automática." };
+  }
+
+  // One send action whose meaning the server decides from current state:
+  // guidance for a live run, reply-and-continue for unfinished work, or a
+  // follow-up task after a closed contract. The label the UI shows comes
+  // from the same capability, so the button never promises something else.
+  sendMessage(taskId: string, commandId: string, text: string): CommandResult {
+    const contract = this.contractOf(taskId);
+    const state = this.readState(taskId).state;
+    if (text.trim() === "") return { accepted: false, commandId, reason: "invalid", revision: contract.revision, state, detail: "Escreva uma mensagem." };
+    const send = this.capabilities(taskId).send;
+    if (!send.allowed) return { accepted: false, commandId, reason: "denied", revision: contract.revision, state, ...(send.reason === undefined ? {} : { detail: send.reason }) };
+    if (send.mode === "steer") return this.steer(taskId, commandId, contract.revision, text, "guide", `msg-${commandId}`);
+    if (send.mode === "follow-up") return this.followUp(taskId, commandId, text);
+    if (state !== "READY") {
+      const resumed = this.resumeTask(taskId, `${commandId}:resume`);
+      if (!resumed.accepted) return { ...resumed, commandId };
+    }
+    const steered = this.steer(taskId, `${commandId}:message`, this.contractOf(taskId).revision, text, "guide", `msg-${commandId}`);
+    if (!steered.accepted) return { ...steered, commandId };
+    const started = this.startTask(taskId, `${commandId}:start`);
+    if (!started.accepted) {
+      return { accepted: true, commandId, taskId, revision: this.contractOf(taskId).revision, state: this.readState(taskId).state, detail: started.detail ?? "Mensagem registrada; a execução não pôde começar agora." };
+    }
+    return { accepted: true, commandId, taskId, revision: this.contractOf(taskId).revision, state: started.state, ...(started.detail === undefined ? {} : { detail: started.detail }) };
+  }
+
+  private followUp(from: string, commandId: string, rawText: string): CommandResult {
+    const text = rawText.trim();
+    if (text === "" || this.draining) throw new Error("follow-up requires a new objective");
+    const prior = this.db.prepare("SELECT payload FROM events WHERE kind='follow-up-request' AND json_extract(payload,'$.commandId')=? LIMIT 1").get(commandId) as { payload: string } | undefined;
+    let next: string;
+    if (prior !== undefined) {
+      const stored = JSON.parse(prior.payload) as { from: string; text: string; next: string };
+      if (stored.from !== from || stored.text !== text) throw new Error("follow-up id reused for a different request");
+      next = stored.next;
+    } else {
+      const previous = this.snapshot(from);
+      // Separate contract and root: no inheritance of authority or
+      // acceptance, only the currently selected route/project/limits.
+      this.db.exec("SAVEPOINT follow_up");
+      try {
+        // Limits and the confirmation policy carry over: never broader.
+        next = this.createTask({ workspace: previous.workspace, objective: text, acceptance: [], provider: previous.provider, model: previous.model, baseUrl: previous.baseUrl,
+          budget: { calls: previous.budget.grantedCalls, tokens: previous.budget.grantedTokens },
+          ...(previous.approvalPolicy === "confirm-mutations" ? { approvalPolicy: "confirm-mutations" as const } : {}) }).taskId;
+        this.recordEvent(next, "follow-up-request", { commandId, from, text, next });
+        this.db.exec("RELEASE follow_up");
+      } catch (error) { this.db.exec("ROLLBACK TO follow_up; RELEASE follow_up"); throw error; }
+    }
+    let detail: string | undefined;
+    if (this.safeState(next) === "READY") {
+      try {
+        const started = this.startTask(next, commandId);
+        if (!started.accepted) detail = started.detail;
+      } catch { /* Created task remains visible and retryable, never duplicate it. */ }
+    }
+    return { accepted: true, commandId, taskId: next, revision: this.safeRevision(next), state: this.safeState(next), ...(detail === undefined ? {} : { detail }) };
+  }
+
+  // Server-side projection of what the human can do now. Purely a read: the
+  // commands themselves revalidate everything when they arrive.
+  capabilities(taskId: string): TaskCapabilities {
+    const state = this.readState(taskId).state;
+    const live = this.live.has(taskId);
+    const unknowns = unknownHistory(this.db, taskId);
+    const gate = live ? null : this.resumeGate(taskId);
+    const blockers = gate?.blockers ?? [];
+    const onlyUnknown = blockers.length > 0 && blockers.every((blocker) => blocker.code === "unknown-effects");
+    const budget = this.readBudget(taskId);
+    const exhausted = (budget.grantedCalls !== null && budget.settledCalls + budget.reservedCalls >= budget.grantedCalls)
+      || (budget.grantedTokens !== null && budget.settledTokens + budget.reservedTokens >= budget.grantedTokens);
+    const no = (reason: string): { allowed: false; reason: string } => ({ allowed: false, reason });
+    const yes = { allowed: true } as const;
+    const closing = this.draining ? "O aplicativo está encerrando." : null;
+    const queued = this.queue.includes(taskId);
+    const stop = closing !== null ? no(closing) : (live && ["RUNNING", "WAITING", "NEEDS_INPUT"].includes(state)) || queued ? yes : no("Não há execução ativa desta tarefa para interromper.");
+    const followUp = closing !== null ? no(closing) : live ? no("Aguarde a execução atual terminar ou interrompa-a.") : yes;
+    let resume: TaskCapabilities["resume"];
+    if (closing !== null) resume = no(closing);
+    else if (live) resume = no("A tarefa já está em execução.");
+    else if (state === "COMPLETED") resume = no("Tarefa concluída. Para continuar, envie uma nova mensagem: ela abre uma tarefa de seguimento com o contexto desta conversa.");
+    else if (exhausted) resume = no("O orçamento desta tarefa acabou. Continue numa nova tarefa de seguimento.");
+    else if (gate?.canResume === true) resume = yes;
+    else if (onlyUnknown) resume = { allowed: false, reason: "Há efeitos incertos. Verifique-os ou reconheça a incerteza para continuar.", requiresAcknowledgement: true };
+    else resume = no(describeBlockers(blockers));
+    let send: TaskCapabilities["send"];
+    if (closing !== null) send = { ...no(closing), mode: "none" };
+    else if (live && (state === "RUNNING" || state === "WAITING" || state === "NEEDS_INPUT")) send = { allowed: true, mode: "steer" };
+    else if (live) send = { ...no("Aguarde a execução atual."), mode: "none" };
+    else if (state === "COMPLETED") send = { allowed: true, mode: "follow-up" };
+    // Exhausted budget or an expired grant cannot be renewed by resuming;
+    // the conversation continues in a follow-up under a new contract.
+    else if (exhausted || (blockers.length > 0 && blockers.every((blocker) => blocker.code === "contract-expired"))) send = { allowed: true, mode: "follow-up" };
+    else if (resume.allowed || state === "READY") send = { allowed: true, mode: "continue" };
+    else send = { ...no(resume.reason ?? "A tarefa não pode continuar agora."), mode: "continue" };
+    const accept = closing !== null ? no(closing) : live ? no("Interrompa ou aguarde a execução antes de aceitar o resultado.") : state === "COMPLETED" ? no("A tarefa já foi concluída.") : state === "READY" && this.modelCallCount(taskId) === 0 ? no("Ainda não há resultado para aceitar.") : yes;
+    const reconcile = unknowns.length === 0 ? no("Não há efeitos incertos.") : live ? no("Reconcilie com a tarefa parada.") : yes;
+    const archive = closing !== null ? no(closing) : live ? no("Não é possível arquivar uma tarefa em execução.") : yes;
+    return { send, stop, resume, accept, reconcile, followUp, archive };
+  }
+
+  private modelCallCount(taskId: string): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM intents WHERE task_id = ? AND operation = 'model.invoke'").get(taskId) as { n: number }).n;
+  }
+
+  private outcome(taskId: string, state: TaskState): TaskOutcome {
+    const uncertainEffects = this.countUnknowns(taskId);
+    const latest = this.db.prepare("SELECT payload FROM events WHERE task_id = ? AND kind = 'task-state' ORDER BY seq DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
+    let basis: unknown;
+    try { basis = latest === undefined ? undefined : (JSON.parse(latest.payload) as { basis?: unknown }).basis; } catch { basis = undefined; }
+    if (state === "COMPLETED" && basis === "accepted-by-human") {
+      const record = this.db.prepare("SELECT payload FROM events WHERE task_id = ? AND kind = 'task.accepted' ORDER BY seq DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
+      const parsed = record === undefined ? {} : JSON.parse(record.payload) as { acceptedAt?: string; note?: string | null };
+      return { kind: "accepted", detail: "Aceito por você: decisão humana registrada, não uma verificação automática.", uncertainEffects, ...(parsed.acceptedAt === undefined ? {} : { acceptedAt: parsed.acceptedAt }), note: parsed.note ?? null };
+    }
+    if (state === "COMPLETED") return { kind: "verified", detail: "Critério de conclusão satisfeito por observação do Lattice.", uncertainEffects };
+    if (state === "BLOCKED") return { kind: "blocked", detail: "A execução não pôde continuar.", uncertainEffects };
+    if (state === "NEEDS_INPUT") {
+      const check = this.db.prepare("SELECT payload FROM events WHERE task_id = ? AND kind = 'acceptance-check' ORDER BY seq DESC LIMIT 1").get(taskId) as { payload: string } | undefined;
+      let review = false;
+      try { review = check !== undefined && (JSON.parse(check.payload) as { review?: unknown }).review === true; } catch { review = false; }
+      if (review) return { kind: "unverified", detail: "O agente terminou, mas este tipo de pedido não tem verificação automática.", uncertainEffects };
+    }
+    return { kind: null, detail: "", uncertainEffects };
+  }
+
+  private resumeGate(taskId: string): { canResume: boolean; blockers: Array<{ code: string; detail: string }> } {
+    try {
+      const report = evaluateResumeGate(
+        this.db,
+        { taskId, generation: this.readGeneration(), packageVersion: PACKAGE_VERSION },
+        { classifyPending: false },
+      );
+      return { canResume: report.canResume, blockers: report.blockers };
+    } catch {
+      return { canResume: false, blockers: [{ code: "gate-error", detail: "Não foi possível avaliar a retomada." }] };
+    }
   }
 
   // Delivers one wake through the WakeGate. Edge wakes (input, approvals)
@@ -1059,28 +1421,23 @@ export class TaskManager {
         const text = payload["objective"];
         const from = command.taskId;
         if (from === undefined || typeof text !== "string" || text.trim() === "" || this.draining || this.safeState(from) !== "COMPLETED") throw new Error("follow-up requires a completed task and a new objective");
-        const prior = this.db.prepare("SELECT payload FROM events WHERE kind='follow-up-request' AND json_extract(payload,'$.commandId')=? LIMIT 1").get(command.commandId) as { payload: string } | undefined;
-        let next: string;
-        if (prior !== undefined) {
-          const stored = JSON.parse(prior.payload) as { from: string; text: string; next: string };
-          if (stored.from !== from || stored.text !== text.trim()) throw new Error("follow-up id reused for a different request");
-          next = stored.next;
-        } else {
-          const previous = this.snapshot(from);
-          // Separate contract and root: no inheritance of conversation or
-          // acceptance, only the currently selected route/project/limits.
-          this.db.exec("SAVEPOINT follow_up");
-          try {
-            next = this.createTask({ workspace: previous.workspace, objective: text.trim(), acceptance: [], provider: previous.provider, model: previous.model, baseUrl: previous.baseUrl,
-              budget: { calls: previous.budget.grantedCalls, tokens: previous.budget.grantedTokens } }).taskId;
-            this.recordEvent(next, "follow-up-request", { commandId: command.commandId, from, text: text.trim(), next });
-            this.db.exec("RELEASE follow_up");
-          } catch (error) { this.db.exec("ROLLBACK TO follow_up; RELEASE follow_up"); throw error; }
+        return this.followUp(from, command.commandId, text);
+      }
+      case "send-message": {
+        const text = payload["text"];
+        if (command.taskId === undefined || typeof text !== "string") {
+          return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
         }
-        if (this.safeState(next) === "READY") {
-          try { this.startTask(next, command.commandId); } catch { /* Created task remains visible and retryable, never duplicate it. */ }
+        return this.sendMessage(command.taskId, command.commandId, text);
+      }
+      case "reconcile": {
+        const attemptId = payload["attemptId"];
+        const action = payload["action"];
+        const note = payload["note"];
+        if (command.taskId === undefined || typeof attemptId !== "string" || (action !== "observe" && action !== "acknowledge" && action !== "treat-as-applied" && action !== "treat-as-not-applied") || (note !== undefined && note !== null && typeof note !== "string")) {
+          return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
         }
-        return { accepted: true, commandId: command.commandId, taskId: next, revision: this.safeRevision(next), state: this.safeState(next) };
+        return this.reconcile(command.taskId, command.commandId, attemptId, action, typeof note === "string" ? note : null);
       }
       case "create-task": {
         const objective = payload["objective"];
@@ -1101,8 +1458,16 @@ export class TaskManager {
         if (rawExpiry !== undefined && rawExpiry !== null && typeof rawExpiry !== "string") throw new Error("expiresAt must be a timestamp or null");
         const rawAcceptance = payload["acceptance"];
         if (rawAcceptance !== undefined && (!Array.isArray(rawAcceptance) || rawAcceptance.some((criterion) => typeof criterion !== "string" || criterion.trim() === ""))) throw new Error("acceptance must be an array of non-empty criteria");
+        // A missing credential is known before anything runs: refuse here
+        // with a reason instead of creating a task that dies on 401.
+        this.resolveWorkspace(workspace);
+        const missingKey = this.missingCredential(provider, baseUrl);
+        if (missingKey !== null) return { accepted: false, commandId: command.commandId, reason: "denied", revision: 0, state: "READY", detail: missingKey };
+        const approval = payload["approval"];
+        if (approval !== undefined && approval !== "none" && approval !== "confirm-mutations") throw new Error("approval must be none or confirm-mutations");
         const { taskId } = this.createTask({ workspace, objective, acceptance: (rawAcceptance ?? []) as string[], provider, model, baseUrl,
-          ...(budget === undefined ? {} : { budget }), ...(rawExpiry === undefined ? {} : { expiresAt: rawExpiry }) });
+          ...(budget === undefined ? {} : { budget }), ...(rawExpiry === undefined ? {} : { expiresAt: rawExpiry }),
+          ...(approval === "confirm-mutations" ? { approvalPolicy: "confirm-mutations" as const } : {}) });
         const contract = this.contractOf(taskId);
         return { accepted: true, commandId: command.commandId, taskId, revision: contract.revision, state: "READY" };
       }
@@ -1134,7 +1499,7 @@ export class TaskManager {
         if (command.taskId === undefined) {
           return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
         }
-        return this.resumeTask(command.taskId, command.commandId);
+        return this.resumeTask(command.taskId, command.commandId, payload["acknowledgeUnknown"] === true);
       }
       case "wake": {
         if (command.taskId === undefined) {
@@ -1182,6 +1547,29 @@ export class TaskManager {
         catch { return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" }; }
         return { accepted: true, commandId: command.commandId, taskId: command.taskId ?? "", revision: 0, state: "READY" };
       }
+      case "accept-result": {
+        const note = payload["note"];
+        if (command.taskId === undefined || (note !== undefined && note !== null && typeof note !== "string")) {
+          return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
+        }
+        return this.acceptResult(command.taskId, command.commandId, typeof note === "string" && note.trim() !== "" ? note.trim().slice(0, 500) : null);
+      }
+      case "decide-approval": {
+        const key = payload["key"];
+        const decision = payload["decision"];
+        const note = payload["note"];
+        if (command.taskId === undefined || typeof key !== "string" || (decision !== "approved" && decision !== "denied") || (note !== undefined && note !== null && typeof note !== "string")) {
+          return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
+        }
+        return this.decideApproval(command.taskId, command.commandId, key, decision, typeof note === "string" && note.trim() !== "" ? note.trim().slice(0, 500) : null);
+      }
+      case "archive-task": {
+        const archived = payload["archived"];
+        if (command.taskId === undefined || (archived !== undefined && typeof archived !== "boolean")) {
+          return { accepted: false, commandId: command.commandId, reason: "invalid", revision: 0, state: "READY" };
+        }
+        return this.archiveTask(command.taskId, command.commandId, archived !== false);
+      }
     }
   }
 
@@ -1210,7 +1598,7 @@ export class TaskManager {
       objective: contract.objective,
       acceptanceCriteria: [...contract.acceptanceCriteria],
       state: state.state,
-      stateReason: state.reason,
+      stateReason: this.queue.includes(taskId) ? `queued: starts when the running task finishes (position ${this.queue.indexOf(taskId) + 1})` : state.reason,
       contractRevision: contract.revision,
       provider: manifest.provider,
       model: manifest.model,
@@ -1224,6 +1612,8 @@ export class TaskManager {
         target: entry.target,
         reason: entry.reason,
         recordedAt: entry.recordedAt,
+        acknowledged: entry.acknowledged,
+        reconcile: entry.operation === "model.invoke" ? "acknowledge-only" as const : entry.operation === "exec" || entry.operation === "process" ? "decide" as const : "observe" as const,
       })),
       waits: listActiveWaits(this.db, taskId).map((wait) => ({
         waitId: wait.waitId,
@@ -1234,6 +1624,15 @@ export class TaskManager {
       })),
       resumable: gate.canResume,
       resumeBlockers: gate.blockers.map((blocker) => blocker.code),
+      capabilities: this.capabilities(taskId),
+      outcome: this.outcome(taskId, state.state),
+      queuePosition: this.queuePosition(taskId),
+      archived: this.isArchived(taskId),
+      approvalPolicy: approvalPolicy(contract),
+      // The human approves what they see: arguments are shown whole up to a
+      // generous bound, and a cut is declared, never silent.
+      approvals: (state.state === "COMPLETED" ? [] : pendingApprovals(this.db, taskId)).map((entry) => ({ key: entry.key, tool: entry.tool, description: entry.description, argsJson: entry.argsJson.slice(0, MAX_APPROVAL_ARGS_CHARS), argsChars: entry.argsJson.length, requestedAt: entry.requestedAt })),
+      approvalHistory: approvalHistory(this.db, taskId),
       budget,
       contextUsage: this.context.read(taskId, manifest),
       messages,
@@ -1241,7 +1640,20 @@ export class TaskManager {
       verifications,
       steering,
       cut: this.seqs.get(taskId) ?? this.maxPersistedSeq(taskId),
+      previous: this.previousTask(taskId),
     };
+  }
+
+  private previousTask(taskId: string): NonNullable<TaskSnapshot["previous"]> | null {
+    const parent = taskLineage(this.db, taskId, 1)[0];
+    if (parent === undefined) return null;
+    try {
+      const contract = this.contractOf(parent);
+      const messages = this.readMessages(parent).filter((message) => message.author !== "system").slice(-20);
+      return { taskId: parent, objective: contract.objective, state: this.readState(parent).state, messages };
+    } catch {
+      return null;
+    }
   }
 
   private readMessages(taskId: string): MessageView[] {
@@ -1355,14 +1767,20 @@ export class TaskManager {
   private readBudget(taskId: string): BudgetView {
     const granted = grantedFromContract(this.contractOf(taskId));
     const snapshot = taskBudgetSnapshot(this.db, taskId, granted);
+    const possible = uncertainReservationTotals(this.db, taskId);
     return {
+      possibleCalls: possible.calls,
+      possibleTokens: possible.tokens,
       grantedCalls: snapshot.granted.calls,
       grantedTokens: snapshot.granted.tokens,
       reservedCalls: snapshot.reserved.calls,
       reservedTokens: snapshot.reserved.tokens,
       settledCalls: snapshot.settled.calls,
       settledTokens: snapshot.settled.tokens,
-      uncertainUsageAttempts: (this.db.prepare(`SELECT COUNT(*) AS n FROM attempt_usage u JOIN attempts a ON a.attempt_id = u.attempt_id JOIN intents i ON i.intent_id = a.intent_id WHERE i.task_id = ? AND u.revision = (SELECT MAX(revision) FROM attempt_usage WHERE attempt_id = u.attempt_id) AND json_extract(u.document, '$.usageFinal') = 0`).get(taskId) as { n: number }).n,
+      // Attempts whose usage is not final, including model calls that never
+      // produced a usage document at all (crash before any response).
+      uncertainUsageAttempts: (this.db.prepare(`SELECT COUNT(*) AS n FROM attempt_usage u JOIN attempts a ON a.attempt_id = u.attempt_id JOIN intents i ON i.intent_id = a.intent_id WHERE i.task_id = ? AND u.revision = (SELECT MAX(revision) FROM attempt_usage WHERE attempt_id = u.attempt_id) AND json_extract(u.document, '$.usageFinal') = 0`).get(taskId) as { n: number }).n
+        + (this.db.prepare(`SELECT COUNT(*) AS n FROM attempts a JOIN intents i ON i.intent_id = a.intent_id WHERE i.task_id = ? AND i.operation = 'model.invoke' AND a.state = 'UNKNOWN' AND a.attempt_id NOT IN (SELECT attempt_id FROM attempt_usage)`).get(taskId) as { n: number }).n,
     };
   }
 
@@ -1389,6 +1807,21 @@ export class TaskManager {
       return { canResume: false, blockers: [{ code: "gate-error" }] };
     }
   }
+}
+
+function describeBlockers(blockers: ReadonlyArray<{ code: string; detail: string }>): string {
+  const texts = blockers.map((blocker) => {
+    switch (blocker.code) {
+      case "contract-expired": return "A autorização desta tarefa expirou; crie uma nova tarefa.";
+      case "terminal-state": return "Tarefa concluída; continue numa tarefa de seguimento.";
+      case "workspace-missing": return "A pasta do projeto não está mais acessível.";
+      case "unknown-effects": return "Há efeitos incertos para verificar ou reconhecer antes de continuar.";
+      case "no-contract": case "no-run": return "O registro desta tarefa está incompleto; não é seguro continuar.";
+      case "active-runtime": return "A tarefa já está em execução.";
+      default: return blocker.detail;
+    }
+  });
+  return texts.length === 0 ? "A tarefa não pode continuar agora." : [...new Set(texts)].join(" ");
 }
 
 function durationBetween(startedAt: string, recordedAt: string | null): number | null {

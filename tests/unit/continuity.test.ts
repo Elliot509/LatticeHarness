@@ -20,7 +20,7 @@ import {
   unknownHistory,
   type ResumeReport,
 } from "../../src/runtime/continuity.js";
-import { admitDurable, claimDurable } from "../../src/runtime/effects.js";
+import { admitDurable, claimDurable, markDispatching } from "../../src/runtime/effects.js";
 import { openLatticeDb, type LatticeDb } from "../../src/storage/db.js";
 
 let dirs: string[] = [];
@@ -164,6 +164,8 @@ describe("workspace drift and stale evidence", () => {
     );
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(opened.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(opened.raw, admitted.attemptId);
     opened.raw.prepare("INSERT INTO receipts (receipt_id, attempt_id, outcome, detail, recorded_at) VALUES (?, ?, ?, ?, ?)").run(
       "receipt-1",
       admitted.attemptId,
@@ -278,6 +280,8 @@ describe("resume gate", () => {
     const claimed = admitDurable(opened.raw, contract, intent("crashed"), { calls: 50, tokens: 200000 }, 1);
     if (!claimed.admitted) throw new Error("admission failed");
     expect(claimDurable(opened.raw, claimed.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(opened.raw, claimed.attemptId);
     const report = evaluateResumeGate(opened.raw, { taskId, generation: 2, packageVersion: "0.0.0" });
     expect(report.canResume).toBe(false);
     expect(report.blockers.some((entry) => entry.code === "unknown-effects")).toBe(true);
@@ -315,6 +319,8 @@ describe("resume gate", () => {
     );
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(opened.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(opened.raw, admitted.attemptId);
     const report = evaluateResumeGate(opened.raw, { taskId, generation: 2, packageVersion: "0.0.0" });
     expect(report.unknowns).toHaveLength(1);
     expect(unknownHistory(opened.raw, taskId)).toHaveLength(1);
@@ -372,6 +378,8 @@ describe("resume gate", () => {
     if (!admitted.admitted) throw new Error("admission failed");
     // Claimed but never resolved: the reservation stays open across restart.
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     first.close();
     openHandles.splice(openHandles.indexOf(first), 1);
 
@@ -428,6 +436,8 @@ describe("resume gate", () => {
     );
     if (!admitted.admitted) throw new Error("admission failed");
     expect(claimDurable(first.raw, admitted.attemptId, 1, 1)).toEqual({ claimed: true });
+    // The executor committed its dispatch marker before the effect started.
+    markDispatching(first.raw, admitted.attemptId);
     first.close();
     openHandles.splice(openHandles.indexOf(first), 1);
 

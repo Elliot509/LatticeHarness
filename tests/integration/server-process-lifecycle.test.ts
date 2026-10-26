@@ -31,7 +31,9 @@ async function setup() {
   fs.mkdirSync(workspace);
   const backend = await startDesktopBackend({ workspace, dataDir });
   backends.push(backend);
-  const { taskId } = backend.tasks.createTask({ workspace: "", objective: "Observe the owned process", acceptance: [], provider: "openai", model: "fixture", baseUrl: "http://127.0.0.1:9" });
+  // Explicit tests-pass: these runs complete on observed TAP output (acceptance-4
+  // would otherwise leave "Observe ..." awaiting human review).
+  const { taskId } = backend.tasks.createTask({ workspace: "", objective: "Observe the owned process", acceptance: ["tests-pass"], provider: "openai", model: "fixture", baseUrl: "http://127.0.0.1:9" });
   return { backend, taskId, workspace, dataDir };
 }
 

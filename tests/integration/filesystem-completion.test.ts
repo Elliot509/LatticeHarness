@@ -10,6 +10,11 @@ import { TaskAcceptance } from "../../src/runtime/acceptance.js";
 import { armFault, clearFaults } from "../../src/runtime/faults.js";
 import { runTaskCommand } from "../../src/cli/run.js";
 
+// Surface-2: anchors are in the system message, observations in tool turns.
+function modelText(request: { system: string; messages: Array<{ content: string }> } | undefined): string {
+  return request === undefined ? "" : [request.system, ...request.messages.map((message) => message.content)].join("\n");
+}
+
 const literal = 'Crie uma pasta chamada "Python" dentro desse lugar.';
 const usage = { inputTokens: 10, outputTokens: 5, inclusiveInput: true };
 const dirs: string[] = [];
@@ -62,8 +67,8 @@ describe("filesystem acceptance through the real task manager", () => {
       expect(provider.requests).toHaveLength(2); expect(provider.remainingSteps).toBe(9);
       expect(done.tools).toHaveLength(2);
       expect(done.verifications.every(v => v.countsKnown === false)).toBe(true);
-      expect(provider.requests[1]?.messages[0]?.content).toContain("not observed");
-      expect(JSON.parse(String(f.db.raw.prepare("SELECT payload FROM events WHERE kind='acceptance-policy'").get()?.["payload"]))).toMatchObject({ source: "default", policyVersion: "acceptance-3" });
+      expect(modelText(provider.requests[1])).toContain("not observed");
+      expect(JSON.parse(String(f.db.raw.prepare("SELECT payload FROM events WHERE kind='acceptance-policy'").get()?.["payload"]))).toMatchObject({ source: "default", policyVersion: "acceptance-4" });
       expect(f.db.raw.prepare("SELECT COUNT(*) AS n FROM intents WHERE state IN ('ADMITTED','CLAIMED','UNKNOWN')").get()).toMatchObject({ n: 0 });
     } finally { await f.tasks.close(); f.db.close(); }
   });
@@ -121,7 +126,7 @@ describe("filesystem acceptance through the real task manager", () => {
       f.tasks.startTask(taskId, "start", provider); await until(() => f.tasks.snapshot(taskId).state !== "RUNNING");
       const snap = f.tasks.snapshot(taskId);
       expect(snap.state).toBe("NEEDS_INPUT"); expect(snap.verifications[0]).toMatchObject({ exitCode: 0, countsKnown: false });
-      expect(provider.requests[1]?.messages[0]?.content).toContain("not observed");
+      expect(modelText(provider.requests[1])).toContain("not observed");
       expect(fs.existsSync(path.join(f.root, "Python"))).toBe(false);
     } finally { await f.tasks.close(); f.db.close(); }
   });
