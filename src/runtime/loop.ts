@@ -33,7 +33,7 @@ import type {
   ToolDefinition,
 } from "../providers/types.js";
 import { normalizeUsageQuantities } from "../telemetry/usage.js";
-import { parseToolArgs, type ToolContext, type ToolResult } from "../tools/types.js";
+import { parseToolArgs, versionKey, type ToolContext, type ToolResult } from "../tools/types.js";
 
 export type LoopDecision = "CONTINUE" | "ASK" | "STOP" | "ESCALATE";
 
@@ -125,6 +125,12 @@ function isPromise(value: unknown): value is Promise<{ wait: WaitRequest } | { w
 
 function isAborted(signal: AbortSignal | undefined): boolean { return signal?.aborted === true; }
 
+// Bounds the `Versões:` anchor, which is never omitted (an oversized anchor
+// would refuse the model call): the least recently established path goes
+// first and the model reads it again if it needs to edit it.
+const MAX_ANCHORED_VERSIONS = 16;
+const MAX_ANCHORED_VERSION_CHARS = 2_000;
+
 export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
   const maxIterations = options.maxIterations;
   const contextChars = options.contextChars ?? 24_000;
@@ -136,6 +142,25 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
   let modelCalls = 0;
   let toolDispatches = 0;
   let editRevision = 0;
+  // Latest edit-usable version per path, as tool results established it. It
+  // is rendered into the always-included `Versões:` anchor, so the version a
+  // read returned survives evidence omission until superseded or retired.
+  // Entries the caller seeded (resume drift `path@version`, verifications)
+  // are dropped once a tool result speaks for the same path.
+  let baseVersions = [...options.taskSurface.versions];
+  const fileVersions = new Map<string, string>();
+  const noteFileVersions = (updates: ReadonlyArray<{ path: string; version: string | null }>): void => {
+    for (const update of updates) {
+      fileVersions.delete(update.path);
+      if (update.version !== null) fileVersions.set(update.path, update.version);
+      baseVersions = baseVersions.filter((entry) => !entry.includes("@") || versionKey(entry.slice(0, entry.lastIndexOf("@"))) !== update.path);
+    }
+    const rendered = (): string[] => [...fileVersions].map(([file, version]) => `${file}@${version}`);
+    while (fileVersions.size > MAX_ANCHORED_VERSIONS || (fileVersions.size > 0 && rendered().join(" | ").length > MAX_ANCHORED_VERSION_CHARS)) {
+      fileVersions.delete(fileVersions.keys().next().value as string);
+    }
+    options.taskSurface.versions = [...baseVersions, ...rendered()];
+  };
   const noteObservation = (action: string, text: string): boolean => {
     // Progress is scoped to actual observations and confirmed edits. No whole
     // workspace scan per tool; unrelated external changes cannot prove progress.
@@ -460,6 +485,7 @@ export async function runTaskLoop(options: LoopOptions): Promise<LoopStop> {
       evidence.push({ id: `ev-${evidence.length + 1}`, text: summary.text });
       if (summary.outcome === "unknown") return stop("ESCALATE", "tool effect UNKNOWN; reconcile before further work", iterations, modelCalls, toolDispatches, options);
       if (call.name === "edit" && summary.outcome === "confirmed") editRevision += 1;
+      if (summary.fileVersions !== undefined) noteFileVersions(summary.fileVersions);
       const observation = JSON.parse(summary.detailJson) as { version?: unknown; observationKey?: unknown; progress?: { scope: string; version: string; items: string[] }; errorKind?: string };
       let repeated: boolean;
       if (observation.progress !== undefined) {
@@ -552,7 +578,7 @@ async function invokeTool(
   registered: RegisteredTool,
   argsJson: string,
   context: ToolContext,
-): Promise<{ outcome: "confirmed" | "failed" | "unknown"; text: string; detailJson: string; handleId?: string | undefined }> {
+): Promise<{ outcome: "confirmed" | "failed" | "unknown"; text: string; detailJson: string; handleId?: string | undefined; fileVersions?: ToolResult["fileVersions"] }> {
   try {
     const { result } = await registered.run(argsJson, context);
     const previewTruncated = (result.detail?.length ?? 0) > 4000;
@@ -579,8 +605,8 @@ async function invokeTool(
     if (result.status === "denied" || result.status === "cancelled" || result.status === "timeout") {
       return { outcome: "unknown", text, detailJson, handleId: result.handleId };
     }
-    if (result.errorKind !== undefined) return { outcome: "failed", text, detailJson, handleId: result.handleId };
-    return { outcome: "confirmed", text, detailJson, handleId: result.handleId };
+    if (result.errorKind !== undefined) return { outcome: "failed", text, detailJson, handleId: result.handleId, fileVersions: result.fileVersions };
+    return { outcome: "confirmed", text, detailJson, handleId: result.handleId, fileVersions: result.fileVersions };
   } catch (error) {
     return {
       outcome: "unknown",

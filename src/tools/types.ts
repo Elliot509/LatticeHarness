@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ToolDefinition } from "../providers/types.js";
 import type { DirectoryPage } from "./directory.js";
 
@@ -26,6 +27,14 @@ export interface ToolResult {
   observationKey?: string;
   directoryPage?: DirectoryPage;
   progress?: { scope: string; version: string; items: string[] };
+  // Edit-usable content versions this result established, keyed by the
+  // workspace-relative path the model used. null: any earlier version of
+  // that path is no longer current (deleted, moved, or found stale).
+  fileVersions?: Array<{ path: string; version: string | null }>;
+}
+
+export function versionKey(requested: string): string {
+  return path.posix.normalize(requested.replace(/\\/g, "/")).replace(/^(\.\/)+/, "");
 }
 
 export interface ToolContext {

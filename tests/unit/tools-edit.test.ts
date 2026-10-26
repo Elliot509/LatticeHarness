@@ -56,13 +56,13 @@ describe("edit tool", () => {
     const context = workspace({ "a.txt": "one\n" });
     const tool = new EditTool();
     const stale = await tool.execute(
-      { kind: "replace", path: "a.txt", expectedVersion: "sha256:deadbeef", oldText: "one", newText: "two" },
+      { kind: "replace", path: "a.txt", expectedVersion: "sha256:deadbeefdeadbeef", oldText: "one", newText: "two" },
       context,
     );
     expect(stale.errorKind).toBe("stale-version");
     expect(fs.readFileSync(path.join(context.workspaceRoot, "a.txt"), "utf8")).toBe("one\n");
     const deleted = await tool.execute(
-      { kind: "delete", path: "a.txt", expectedVersion: "sha256:deadbeef" },
+      { kind: "delete", path: "a.txt", expectedVersion: "sha256:deadbeefdeadbeef" },
       context,
     );
     expect(deleted.errorKind).toBe("stale-version");

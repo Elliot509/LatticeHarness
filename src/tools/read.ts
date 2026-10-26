@@ -4,7 +4,7 @@ import type { ToolDefinition } from "../providers/types.js";
 import { resolveInScope } from "../platform/paths.js";
 import { HandleRegistry } from "./handles.js";
 import { DirectoryReader } from "./directory.js";
-import { toolFailure, type Tool, type ToolContext, type ToolResult } from "./types.js";
+import { toolFailure, versionKey, type Tool, type ToolContext, type ToolResult } from "./types.js";
 
 export interface ReadArgs {
   path: string;
@@ -74,6 +74,12 @@ function expansion(absolute: string, version: string, start: number): () => stri
 
 export function contentVersion(content: Buffer): string {
   return `sha256:${createHash("sha256").update(content).digest("hex").slice(0, 16)}`;
+}
+
+// The whole-file content version is what edit compares against, so a line
+// read names it in the summary the model sees, whatever range was rendered.
+function versionNote(version: string): string {
+  return `version ${version} (whole file; edit expectedVersion)`;
 }
 
 export class ReadTool implements Tool<ReadArgs> {
@@ -152,7 +158,7 @@ export class ReadTool implements Tool<ReadArgs> {
         let encoding = "UTF-8";
         try { detail = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, read)); }
         catch { detail = bytes.subarray(0, read).toString("base64"); encoding = "base64 (binary or split UTF-8 range)"; }
-        return { status: "completed", summary: `${rawArgs.path} bytes ${offset}-${offset + read} of ${stat.size} (${encoding}; metadata version)`, detail, version: `metadata:${stat.size}:${stat.mtimeMs}`, complete, truncated: !complete };
+        return { status: "completed", summary: `${rawArgs.path} bytes ${offset}-${offset + read} of ${stat.size} (${encoding}; metadata version, not an edit expectedVersion: read by lines for that)`, detail, version: `metadata:${stat.size}:${stat.mtimeMs}`, complete, truncated: !complete };
       } catch { return toolFailure("unreadable", "cannot read byte range", false); }
       finally { if (fd !== undefined) fs.closeSync(fd); }
     }
@@ -164,20 +170,23 @@ export class ReadTool implements Tool<ReadArgs> {
       return toolFailure("unreadable", `cannot read ${rawArgs.path}: ${error instanceof Error ? error.message : "unknown error"}`, true);
     }
     const version = contentVersion(buffer);
+    const fileVersions = [{ path: versionKey(rawArgs.path), version }];
     if (buffer.length === 0) {
       return {
         status: "completed",
-        summary: `empty file ${rawArgs.path}`,
+        summary: `empty file ${rawArgs.path}; ${versionNote(version)}`,
         detail: "",
         version,
+        fileVersions,
         complete: true,
       };
     }
     if (buffer.includes(0)) {
       return {
         status: "completed",
-        summary: `binary file ${rawArgs.path} (${stat.size} bytes); content not rendered`,
+        summary: `binary file ${rawArgs.path} (${stat.size} bytes); content not rendered; ${versionNote(version)}`,
         version,
+        fileVersions,
         complete: false,
       };
     }
@@ -188,8 +197,9 @@ export class ReadTool implements Tool<ReadArgs> {
     } catch {
       return {
         status: "completed",
-        summary: `non-UTF8 file ${rawArgs.path}; content not rendered`,
+        summary: `non-UTF8 file ${rawArgs.path}; content not rendered; ${versionNote(version)}`,
         version,
+        fileVersions,
         complete: false,
       };
     }
@@ -219,9 +229,10 @@ export class ReadTool implements Tool<ReadArgs> {
     if (omittedLines <= 0 && omittedBytes <= 0) {
       return {
         status: "completed",
-        summary: `${rawArgs.path} lines ${start}-${start + selected.length - 1} of ${totalLines}`,
+        summary: `${rawArgs.path} lines ${start}-${start + selected.length - 1} of ${totalLines}; ${versionNote(version)}`,
         detail: rendered,
         version,
+        fileVersions,
         complete: true,
       };
     }
@@ -229,9 +240,10 @@ export class ReadTool implements Tool<ReadArgs> {
     const handleId = this.handles.store("read", `${rawArgs.path}@${version} (${note})`, expansion(absolute, version, start));
     return {
       status: "completed",
-      summary: `${rawArgs.path} lines ${start}-${start + selected.length - 1} of ${totalLines}; ${note}`,
+      summary: `${rawArgs.path} lines ${start}-${start + selected.length - 1} of ${totalLines}; ${versionNote(version)}; ${note}`,
       detail: rendered,
       version,
+      fileVersions,
       complete: false,
       truncated: true,
       truncationNote: note,
