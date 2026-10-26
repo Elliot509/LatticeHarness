@@ -288,7 +288,7 @@ try {
     env: { ...process.env, LATTICE_DATA_DIR: upgradeData },
   });
   const upgradeReport = JSON.parse(upgradeOut);
-  if (upgradeReport.schemaVersion !== 3) fail(`upgrade did not migrate to schema 3: ${upgradeOut.slice(0, 200)}`);
+  if (upgradeReport.schemaVersion !== SCHEMA_VERSION) fail(`upgrade did not migrate to schema ${SCHEMA_VERSION}: ${upgradeOut.slice(0, 200)}`);
   {
     const reopened = new DatabaseSync(upgradeDbPath);
     try {

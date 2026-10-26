@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 const META_SCHEMA_KEY = "schema_version";
 
 export class FutureSchemaError extends Error {
@@ -8,7 +8,8 @@ export class FutureSchemaError extends Error {
   readonly supported: number;
   constructor(found: number, supported: number) {
     super(
-      `Database schema version ${found} is newer than supported ${supported}; refusing downgrade`,
+      `Database schema version ${found} is newer than supported ${supported}; refusing downgrade. ` +
+        "This data folder was updated by a newer Lattice; open it with that version or a newer one.",
     );
     this.name = "FutureSchemaError";
     this.found = found;
@@ -163,10 +164,24 @@ CREATE TABLE IF NOT EXISTS composition_epochs (
 );
 `;
 
+// v4 (compatibility generation): this runtime records data that earlier
+// runtimes would misread as permission to act: per-task confirmation policy
+// and pending approvals, INTERRUPTED tasks and unanswered tool calls. Every
+// shipped v3 runtime refuses a newer schema before touching the database
+// (FutureSchemaError), so the version bump itself keeps them out of an
+// upgraded data folder. Additive only: one index for the per-task event
+// lookups (approvals, conversation) and a note naming the generation.
+const V4_SCHEMA = `
+CREATE INDEX IF NOT EXISTS events_task_kind ON events (task_id, kind, seq);
+INSERT INTO meta (key, value) VALUES ('compatibility', 'v4: confirmation policy, approvals, INTERRUPTED, structured conversation; v3 runtimes must not open this folder')
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+`;
+
 const MIGRATIONS: readonly Migration[] = [
   { toVersion: 1, destructive: false, sql: V1_SCHEMA },
   { toVersion: 2, destructive: false, sql: V2_SCHEMA },
   { toVersion: 3, destructive: false, sql: V3_SCHEMA },
+  { toVersion: 4, destructive: false, sql: V4_SCHEMA },
 ];
 
 export function readSchemaVersion(db: DatabaseSync): number {

@@ -58,7 +58,7 @@ describe("storage upgrade", () => {
     buildV1Database(dataDir);
     const opened = openLatticeDb(dataDir);
     openHandles.push(opened);
-    expect(readSchemaVersion(opened.raw)).toBe(3);
+    expect(readSchemaVersion(opened.raw)).toBe(4);
     const contract = opened.raw.prepare("SELECT document FROM contracts WHERE task_id = 'task-old'").get() as { document: string };
     expect(JSON.parse(contract.document)).toMatchObject({ objective: "old work" });
     const run = opened.raw.prepare("SELECT session_id FROM runs WHERE task_id = 'task-old'").get() as { session_id: string };

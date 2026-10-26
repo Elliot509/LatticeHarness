@@ -85,6 +85,17 @@ start. An effect that was dispatched without a recorded receipt stays `UNKNOWN`
 and is never repeated or reclassified automatically; the human observes,
 records or acknowledges it. A model call in flight is counted as possibly consumed.
 
+## Data folder compatibility between versions
+
+Data written by this version (schema v4) includes per-task confirmation policies
+and pending approvals. Every earlier build refuses a folder with a newer schema
+before reading it, so an earlier runtime cannot ignore those approvals by opening
+the same folder; it stops with an error instead. The current runtime does not
+upgrade a folder while another live process owns it. The protection relies on the
+schema check that earlier builds already perform: it does not cover modified
+builds, hand-edited databases or copies with a rewritten version, and it does not
+restrict anything outside the Lattice data folder.
+
 Keep credentials, browser profiles, databases and local validation evidence
 out of source commits and distribution packages. Report a suspected leak
 through the private reporting route above.

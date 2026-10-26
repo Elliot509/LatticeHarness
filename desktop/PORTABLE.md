@@ -57,6 +57,10 @@ Ubuntu setup, an administrator can remove the exact `/opt/lattice-friday-demo`
 prefix and `/usr/share/applications/lattice-friday.desktop`. Retain the data
 directory to keep history, or remove it explicitly if you intend to delete data.
 
+A data directory opened by this version is upgraded to schema v4. Earlier bundles
+refuse it at startup ("Database schema version 4 is newer than supported 3") and do
+not modify it; to run an earlier bundle again, give it a different data directory.
+
 A human-run OpenRouter trial with `meta/muse-spark-1.3-contributor` completed
 `Crie uma pasta chamada "Python" dentro desse lugar.` in one model call, with
 the directory created and `directory-exists:Python` satisfied, without looping.

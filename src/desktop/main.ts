@@ -256,7 +256,13 @@ if (primaryInstance) app.whenReady().then(
   () => {
     createWindow().catch((error: unknown) => {
       process.stderr.write(`lattice desktop failed to start: ${error instanceof Error ? error.message : "unknown error"}\n`);
-      dialog.showErrorBox("Lattice não abriu", "Não foi possível iniciar o aplicativo. Confira a pasta de dados e se outra janela Lattice já está aberta.\n\n" + (error instanceof Error ? error.message : "Falha de inicialização"));
+      const message = error instanceof Error ? error.message : "Falha de inicialização";
+      const advice = /newer than supported/u.test(message)
+        ? "Esta pasta de dados foi atualizada por uma versão mais nova do Lattice. Abra-a com essa versão (ou mais nova); versões anteriores não podem usá-la com segurança."
+        : /owned by live process/u.test(message)
+          ? "Outro aplicativo Lattice (talvez de outra versão) está usando esta pasta de dados. Feche-o e tente de novo."
+          : "Não foi possível iniciar o aplicativo. Confira a pasta de dados e se outra janela Lattice já está aberta.";
+      dialog.showErrorBox("Lattice não abriu", `${advice}\n\n${message}`);
       app.exit(1);
     });
   },

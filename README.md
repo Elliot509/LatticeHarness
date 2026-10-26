@@ -326,6 +326,16 @@ locally. Desktop uses `${XDG_DATA_HOME:-~/.local/share}/lattice` on Linux and
 `%LOCALAPPDATA%\Lattice` on Windows, including its browser profile. Keep those data
 when replacing application binaries if you want to retain history.
 
+**Data folder versions.** This version stores its data in schema **v4**: it records
+confirmation policies, pending approvals and interrupted tasks that earlier builds
+would not understand (an earlier build could run an action that still awaits your
+confirmation). Opening a v3 folder upgrades it in place, keeping every row; the
+upgrade never runs while another Lattice process owns the folder. Earlier (v3)
+builds refuse a v4 folder at startup ("Database schema version 4 is newer than
+supported 3") without touching it, so **going back to an earlier build means using
+a different data folder**. A build from a modified source, or a folder edited by
+hand, is outside this protection.
+
 Uncertain effects prevent blind retry and success claims. Resume does not renew
 budget/authority or adopt orphan processes. Ownership/migration concurrency,
 retention/scale, general late-usage reconciliation, external writers, detached

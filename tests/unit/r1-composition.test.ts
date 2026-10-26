@@ -157,14 +157,14 @@ describe("r1 composition and binding", () => {
     const up1 = openLatticeDb(v1dir);
     openHandles.push(up1);
     expect(readSchemaVersion(up1.raw)).toBe(SCHEMA_VERSION);
-    expect(SCHEMA_VERSION).toBe(3);
+    expect(SCHEMA_VERSION).toBe(4);
     // Epoch table usable immediately after upgrade (lazy ensure + migration agree).
     expect(advanceCompositionEpoch(up1.raw, "task-old", compositionForRoute("openai", "m1", TOOLS)).epoch).toBe(1);
-    // Fresh v3 + reopen reconstruction.
+    // Fresh database at the current version + reopen reconstruction.
     const fresh = tmp("r1migfresh");
     const f1 = openLatticeDb(fresh);
     openHandles.push(f1);
-    expect(readSchemaVersion(f1.raw)).toBe(3);
+    expect(readSchemaVersion(f1.raw)).toBe(SCHEMA_VERSION);
     advanceCompositionEpoch(f1.raw, "task-9", compositionForRoute("local", "m", TOOLS));
     f1.close();
     openHandles.splice(openHandles.indexOf(f1), 1);

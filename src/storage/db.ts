@@ -93,6 +93,7 @@ export function openLatticeDb(dataDir: string): LatticeDb {
     // BEGIN IMMEDIATE can throw the untyped busy error. 5s matches the
     // short-transaction discipline (ownership + migrations are ms-scale).
     raw.exec("PRAGMA busy_timeout = 5000");
+    refuseUpgradeUnderLiveOwner(raw);
     migrate(raw);
   } catch (error) {
     try {
@@ -110,6 +111,17 @@ export function openLatticeDb(dataDir: string): LatticeDb {
       raw.close();
     },
   };
+}
+
+// An upgrade never runs under another live process: an older runtime that
+// already opened this folder keeps its own view until it exits, and must not
+// find the schema changed beneath it. Same-process reopens and dead owners
+// proceed (a dead owner is recovered by claimOwnership as before).
+function refuseUpgradeUnderLiveOwner(raw: DatabaseSync): void {
+  const version = readSchemaVersion(raw);
+  if (version === 0 || version >= SCHEMA_VERSION) return;
+  const owner = raw.prepare("SELECT generation, pid FROM ownership WHERE id = 1").get() as { generation: number; pid: number } | undefined;
+  if (owner !== undefined && owner.pid !== process.pid && ownerAlive(owner.pid)) throw new OwnershipHeldError(owner.pid, owner.generation);
 }
 
 export function currentSchemaVersion(db: DatabaseSync): number {
