@@ -8,8 +8,8 @@ Cursor, plugins ou automações) que trabalhe neste repositório.
 `LatticeHarness-Candidate` é a árvore canônica de desenvolvimento do Lattice.
 Remote: `https://github.com/Elliot509/LatticeHarness-Candidate.git`.
 
-Existe uma árvore histórica em `/home/elcrio/LatticeHarness` com um histórico
-Git **disjunto** deste. Ela está preservada como registro, não recebe mais
+Existe uma árvore histórica local (`LatticeHarness`, fora deste repositório)
+com um histórico Git **disjunto** deste. Ela está preservada como registro, não recebe mais
 implementações, e não contém nenhum arquivo de código ausente daqui.
 Verificado em 2026-10-19: zero arquivos exclusivos sob `src/`, `tests/`,
 `scripts/`, `desktop/`, `fixtures/` e `.github/`.

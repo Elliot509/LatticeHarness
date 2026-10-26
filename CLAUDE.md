@@ -6,8 +6,9 @@ Leia aquele arquivo por inteiro antes de trabalhar aqui.
 Dois pontos que valem repetir, porque errá-los é caro:
 
 1. **Árvore canônica.** Esta é a árvore canônica
-   (`LatticeHarness-Candidate`). `/home/elcrio/LatticeHarness` é histórica,
-   com histórico Git disjunto, e não recebe implementações.
+   (`LatticeHarness-Candidate`). A árvore local `LatticeHarness`, fora deste
+   repositório, é histórica, com histórico Git disjunto, e não recebe
+   implementações.
 
 2. **Publicação.** Antes de qualquer `git commit`, `git push`, tag, release ou
    deploy, leia e cumpra **`docs/PUBLICATION_BOUNDARIES.md`**. Artefatos locais
