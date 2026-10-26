@@ -35,7 +35,7 @@ export interface TaskContract {
   // GUIDANCE: rendered to the model, never hard enforcement.
   restrictions?: TypedHardRestrictions | undefined;
   // Opt-in human confirmation for mutating tools (edit, exec, process
-  // spawn/stdin/stop), enforced at admission (runtime/approval.ts).
+  // spawn/stdin/stop), enforced by the loop before admission (runtime/approval.ts).
   approvalPolicy?: "none" | "confirm-mutations" | undefined;
   realm: string;
   allowedProvider: string | null;
