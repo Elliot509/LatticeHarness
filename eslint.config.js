@@ -2,7 +2,8 @@ import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist/**", "node_modules/**", "fixtures/**", ".lattice-audit/**", "tmp/**"] },
+  // .trail/ holds local agent-tool artifacts (hooks, caches), never product code.
+  { ignores: ["dist/**", "node_modules/**", "fixtures/**", ".lattice-audit/**", "tmp/**", ".trail/**"] },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   {
@@ -25,10 +26,10 @@ export default tseslint.config(
   },
   {
     ...tseslint.configs.disableTypeChecked,
-    files: ["tests/**/*.ts", "scripts/**/*.mjs", "*.config.*"],
+    files: ["tests/**/*.ts", "tests/**/*.mjs", "scripts/**/*.mjs", "*.config.*"],
   },
   {
-    files: ["scripts/**/*.mjs"],
+    files: ["scripts/**/*.mjs", "tests/**/*.mjs"],
     languageOptions: {
       globals: {
         console: "readonly",
@@ -38,6 +39,7 @@ export default tseslint.config(
         setInterval: "readonly",
         clearInterval: "readonly",
         fetch: "readonly",
+        globalThis: "readonly",
       },
     },
   },

@@ -2,9 +2,13 @@
 .lattice-audit/
 Audit_Prompt/
 
-# Project docs tracked in git but excluded from the npm tarball
-# (tarball contents are set by package.json "files": dist, README, LICENSE)
-docs/
+# Project docs are not part of the npm tarball (package.json "files" decides
+# that). They stay out of git by default, with the publication policy as the
+# one tracked exception: it must reach every clone. Use docs/* (not docs/) so
+# the negation below can take effect -- git cannot re-include a file whose
+# parent DIRECTORY is excluded.
+docs/*
+!docs/PUBLICATION_BOUNDARIES.md
 Regras/
 
 # Secrets and credentials
@@ -51,6 +55,17 @@ tmp/
 artifacts/
 test-results/
 playwright-report/
+
+# Local agent/tooling artifacts (see docs/PUBLICATION_BOUNDARIES.md).
+# These stay on the machine: tools keep working, nothing of theirs is published.
+.trail/
+.mcp.json
+.claude/
+.codex/
+.cursor/
+.opencode/
+.continue/
+.aider*
 
 # IDE and OS files
 .vscode/
