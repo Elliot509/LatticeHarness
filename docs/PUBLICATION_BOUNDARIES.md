@@ -66,7 +66,9 @@ autorização específica.
 ## Portão obrigatório antes de publicar
 
 1. Confirme qual é o repositório e a branch canônicos; não presuma que
-   `LatticeHarness` e `LatticeHarness-Candidate` são a mesma árvore.
+   a árvore local histórica `LatticeHarness` e a canônica (pasta
+   `LatticeHarness-Candidate`, publicada como `Elliot509/LatticeHarness`) são a
+   mesma árvore.
    A árvore canônica está declarada em `CLAUDE.md` / `AGENTS.md`.
 2. Faça o inventário de arquivos rastreados e não rastreados, incluindo os
    produzidos por plugins/hooks após o último comando.

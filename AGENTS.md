@@ -5,8 +5,11 @@ Cursor, plugins ou automações) que trabalhe neste repositório.
 
 ## 1. Esta é a árvore canônica
 
-`LatticeHarness-Candidate` é a árvore canônica de desenvolvimento do Lattice.
-Remote: `https://github.com/Elliot509/LatticeHarness-Candidate.git`.
+Esta árvore é a árvore canônica de desenvolvimento do Lattice (pasta local
+`LatticeHarness-Candidate`).
+Remote oficial: `https://github.com/Elliot509/LatticeHarness.git`. Até 2026-10-27
+o repositório se chamava `LatticeHarness-Candidate`; o endereço antigo redireciona
+para o oficial.
 
 Existe uma árvore histórica local (`LatticeHarness`, fora deste repositório)
 com um histórico Git **disjunto** deste. Ela está preservada como registro, não recebe mais
@@ -15,7 +18,8 @@ Verificado em 2026-10-19: zero arquivos exclusivos sob `src/`, `tests/`,
 `scripts/`, `desktop/`, `fixtures/` e `.github/`.
 
 Se você iniciou a sessão na árvore histórica, confirme com o responsável antes
-de implementar qualquer coisa.
+de implementar qualquer coisa. O histórico dela é mantido em backup privado e
+**nunca** é enviado ao remoto oficial: não faça push a partir dela.
 
 ## 2. Política de publicação — leitura obrigatória antes de qualquer commit
 

@@ -55,8 +55,8 @@ Requires **Node.js >=22.13.0**, npm, and Git for cloning. A browser is needed fo
 web UI; project commands require their own toolchains. SQLite comes from Node.
 
 ```sh
-git clone https://github.com/Elliot509/LatticeHarness-Candidate.git
-cd LatticeHarness-Candidate
+git clone https://github.com/Elliot509/LatticeHarness.git
+cd LatticeHarness
 npm ci --ignore-scripts
 npm run build
 node dist/cli/main.js ui --workspace /path/to/disposable-project
@@ -456,7 +456,9 @@ Browser tests require a usable Chromium executable; unavailable/skipped tests
 cannot qualify browser behavior. Fixtures exercise real effects with synthetic
 model responses. Native Electron and exact portable artifacts require separate
 checks; npm pack does not prove either. CI includes Node 22.13.0/24.x on Linux
-and Windows; a configured matrix is not a claim that every run passed.
+and Windows; a configured matrix is not a claim that every run passed. On the
+current revision the Linux jobs pass and the Windows jobs fail (path separators,
+a test file name Windows cannot create, a child-process loader, browser startup).
 
 Contributions should identify the behavior, regression and evidence; preserve
 unrelated work and exclude keys, local databases, logs, profiles and operator
