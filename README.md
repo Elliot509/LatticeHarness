@@ -123,11 +123,11 @@ bundle and isolated launch instructions are delivered separately to its owner.
 
 6. For this recognized, simple creation request, leave the optional criterion
    blank: Lattice derives `directory-exists:TesteMuse` and checks the filesystem.
-   To specify it yourself, expand **Critério de conclusão opcional** and enter
-   that criterion. Explicit criteria take precedence; ambiguous or compound
-   creation requests need an explicit target/criterion instead of silently
-   discarding additional work. Optional call and cumulative token limits are
-   separate controls.
+   To specify it yourself, expand **Avançado: como o Lattice decide que terminou**
+   and enter that criterion in **Critério explícito (opcional)**. Explicit
+   criteria take precedence; ambiguous or compound creation requests need an
+   explicit target/criterion instead of silently discarding additional work.
+   Optional call and cumulative token limits are separate controls.
 7. Start the task. Inspect the original objective, tool activity, output and
    acceptance result. Expect the target directory to exist and state **Concluído**
    (`COMPLETED`); command exit 0 or the model saying “done” alone is insufficient.
